@@ -1614,7 +1614,7 @@ public:
         RegisterHandlersTipc({
             {1, &INx2VideoSession::CreateDecoderService, "CreateVideoDecoderService"},
             {3, &INx2VideoSession::GetEvent, "GetEvent"},
-            {6, &INx2VideoSession::Succeed, "Start"},
+            {6, &INx2VideoSession::Start, "Start"},
             {8, &INx2VideoSession::Flush, "Flush"},
             {101, &INx2VideoSession::Configure, "Configure"},
             {109, &INx2VideoSession::SubmitInput, "SubmitInputBuffer"},
@@ -1711,6 +1711,43 @@ private:
         TipcReplyWords(ctx, {});
     }
 
+    void Start(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
+        Log(ctx, "start");
+        const u32 counter_id = w[3];
+        const u32 start_value = w[4];
+        if (m_syncpoint != NoSyncpoint && counter_id == ~m_syncpoint) {
+            CompleteHandedOutImagesUpTo(start_value);
+        }
+        TipcReplyWords(ctx, {});
+    }
+
+    void CompleteHandedOutImagesUpTo(u32 start_value) {
+        auto& syncpoints = system.Host1x().GetSyncpointManager();
+        u32 images_completed = 0;
+        {
+            std::scoped_lock lk{m_mutex};
+            u32 reached = syncpoints.GetGuestSyncpointValue(m_syncpoint);
+            while (static_cast<s32>(start_value - reached) > 0) {
+                if (!m_free.empty()) {
+                    const u32 image = m_free.front();
+                    m_free.pop_front();
+                    m_release_fences.erase(image);
+                    m_outputs.push_back({image, m_width, m_height, 0, false});
+                    ++images_completed;
+                }
+                syncpoints.IncrementGuest(m_syncpoint);
+                ++reached;
+            }
+            m_sync_base = reached;
+            m_handed = static_cast<u32>(m_free.size());
+        }
+        if (images_completed != 0) {
+            LOG_INFO(Service, "{} start at syncpoint value {:#x} completes {} handed-out images",
+                     GetServiceName(), start_value, images_completed);
+        }
+    }
+
     void Configure(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         std::vector<u8> configuration;
@@ -1775,10 +1812,6 @@ private:
         u32 value;
         {
             std::scoped_lock lk{m_mutex};
-            m_free.push_back(image);
-            if (release_fence) {
-                m_release_fences[image] = *release_fence;
-            }
             // After the end of a stream nothing fills an image again, so a release completes at
             // once: its fence is the syncpoint's current value. Mario Kart World releases its
             // images after a movie ends and waits for the returned fences; a fence for a frame
@@ -1789,7 +1822,12 @@ private:
                 m_sync_base = reached;
                 m_handed = 0;
                 value = reached;
+                m_images_released_after_end_of_stream.push_back(image);
             } else {
+                m_free.push_back(image);
+                if (release_fence) {
+                    m_release_fences[image] = *release_fence;
+                }
                 value = m_sync_base + ++m_handed;
             }
         }
@@ -1836,6 +1874,7 @@ private:
             std::scoped_lock lk{m_mutex};
             m_inputs.push_back(std::move(input));
             m_stream_ended = false;
+            m_images_released_after_end_of_stream.clear();
             m_ready->room.store(m_inputs.size() < MaxQueuedInputs, std::memory_order_relaxed);
         }
         m_cv.notify_one();
@@ -1852,6 +1891,7 @@ private:
             m_inputs.clear();
             m_flush = true;
             m_stream_ended = false;
+            m_images_released_after_end_of_stream.clear();
             m_ready->room.store(true, std::memory_order_relaxed);
         }
         m_cv.notify_one();
@@ -1866,6 +1906,13 @@ private:
             if (!m_outputs.empty()) {
                 output = m_outputs.front();
                 m_outputs.pop_front();
+            } else if (m_stream_ended && m_end_of_stream_output &&
+                       !m_images_released_after_end_of_stream.empty()) {
+                output = *m_end_of_stream_output;
+                output->image = m_images_released_after_end_of_stream.front();
+                m_images_released_after_end_of_stream.pop_front();
+                LOG_INFO(Service, "{} repeats the end-of-stream frame in released image {}",
+                          GetServiceName(), output->image);
             }
         }
         if (!output) {
@@ -1929,6 +1976,7 @@ private:
                 m_outputs.push_back({image, width, height, frame.pts, frame.end});
                 if (frame.end) {
                     m_stream_ended = true;
+                    m_end_of_stream_output = m_outputs.back();
                 }
                 system.Host1x().GetSyncpointManager().IncrementGuest(m_syncpoint);
                 ++m_frames_out;
@@ -2099,6 +2147,8 @@ private:
     std::deque<u32> m_free;            ///< Output images, in the order the client acquires them
     std::map<u32, Fence> m_release_fences;
     std::deque<Output> m_outputs;      ///< Finished, for 213
+    std::optional<Output> m_end_of_stream_output;
+    std::deque<u32> m_images_released_after_end_of_stream;
     bool m_stream_ended{};             ///< End-of-stream frame handed out, nothing submitted since
     bool m_flush{};
     bool m_quit{};
