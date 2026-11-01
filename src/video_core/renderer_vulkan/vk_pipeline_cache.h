@@ -107,6 +107,8 @@ struct ShaderPools {
     Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_block{32};
 };
 
+inline constexpr u64 DKB_TERRAIN_CULLING_GEOMETRY_SHADER_HASH = 0x5b7bdd2ad167a039ULL;
+
 class PipelineCache : public VideoCommon::ShaderCache {
 public:
     explicit PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, const Device& device,
@@ -119,6 +121,8 @@ public:
 
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
 
+    [[nodiscard]] u64 CurrentUnsupportedGeometryShaderHash() const;
+
     [[nodiscard]] ComputePipeline* CurrentComputePipeline();
 
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
@@ -126,6 +130,8 @@ public:
 
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
+
+    [[nodiscard]] bool NeedsMissingGeometryStage(const GraphicsPipelineCacheKey& key) const;
 
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) const noexcept;
 
@@ -137,6 +143,8 @@ private:
     std::unique_ptr<GraphicsPipeline> BuildNewGraphicsPipeline();
 
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
+
+    std::unique_ptr<GraphicsPipeline> CreateGraphicsPipelineWithoutGeometryStage();
 
     /// Builds graphics_key's pipeline on the GPU thread if the shaders of an earlier pipeline
     /// fit it, so only the driver compile is left (on the pipeline workers). Null otherwise.

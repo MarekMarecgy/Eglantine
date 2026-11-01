@@ -346,8 +346,9 @@ GraphicsPipeline::GraphicsPipeline(
     configure_func = ConfigureFunc(*spv_modules, stage_infos);
 }
 
-void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
-    transition_keys.push_back(transition->key);
+void GraphicsPipeline::AddTransition(const GraphicsPipelineCacheKey& transition_key,
+                                     GraphicsPipeline* transition) {
+    transition_keys.push_back(transition_key);
     transitions.push_back(transition);
 }
 
