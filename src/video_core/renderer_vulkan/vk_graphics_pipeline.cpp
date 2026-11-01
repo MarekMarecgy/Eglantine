@@ -750,6 +750,14 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
             if (!attribute.enabled || !stage_infos[0].loads.Generic(index)) {
                 continue;
             }
+            if (attribute.buffer >= num_vertex_arrays ||
+                index >= device.GetMaxVertexInputAttributes()) {
+                LOG_WARNING(Render_Vulkan,
+                            "Vertex attribute {} reads buffer {} beyond the device limits "
+                            "({} bindings, {} attributes)",
+                            index, attribute.buffer.Value(), num_vertex_arrays,
+                            device.GetMaxVertexInputAttributes());
+            }
             vertex_attributes.push_back({
                 .location = static_cast<u32>(index),
                 .binding = attribute.buffer,
