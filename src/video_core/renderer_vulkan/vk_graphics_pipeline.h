@@ -111,7 +111,7 @@ public:
     GraphicsPipeline& operator=(const GraphicsPipeline&) = delete;
     GraphicsPipeline(const GraphicsPipeline&) = delete;
 
-    void AddTransition(GraphicsPipeline* transition);
+    void AddTransition(const GraphicsPipelineCacheKey& transition_key, GraphicsPipeline* transition);
 
     bool Configure(bool is_indexed) {
         return configure_func(this, is_indexed);

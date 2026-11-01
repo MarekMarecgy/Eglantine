@@ -149,12 +149,32 @@ void EmitEpilogue(EmitContext& ctx) {
     }
 }
 
+template <typename EmitOnStreamZero>
+void EmitOnRasterizedStreamOnly(EmitContext& ctx, const IR::Value& stream,
+                                EmitOnStreamZero&& emit_on_stream_zero) {
+    if (stream.IsImmediate()) {
+        if (stream.U32() == 0) {
+            emit_on_stream_zero();
+        }
+        return;
+    }
+    const Id is_stream_zero{ctx.OpIEqual(ctx.U1, ctx.Def(stream), ctx.u32_zero_value)};
+    const Id emit_label{ctx.OpLabel()};
+    const Id merge_label{ctx.OpLabel()};
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(is_stream_zero, emit_label, merge_label);
+    ctx.AddLabel(emit_label);
+    emit_on_stream_zero();
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
+}
+
 void EmitEmitVertex(EmitContext& ctx, const IR::Value& stream) {
     if (ctx.runtime_info.convert_depth_mode && !ctx.profile.support_native_ndc) {
         ConvertDepthMode(ctx);
     }
     if (!ctx.profile.support_geometry_streams) {
-        throw NotImplementedException("Geometry streams");
+        EmitOnRasterizedStreamOnly(ctx, stream, [&] { ctx.OpEmitVertex(); });
     } else if (stream.IsImmediate()) {
         ctx.OpEmitStreamVertex(ctx.Def(stream));
     } else {
@@ -167,7 +187,7 @@ void EmitEmitVertex(EmitContext& ctx, const IR::Value& stream) {
 
 void EmitEndPrimitive(EmitContext& ctx, const IR::Value& stream) {
     if (!ctx.profile.support_geometry_streams) {
-        throw NotImplementedException("Geometry streams");
+        EmitOnRasterizedStreamOnly(ctx, stream, [&] { ctx.OpEndPrimitive(); });
     } else if (stream.IsImmediate()) {
         ctx.OpEndStreamPrimitive(ctx.Def(stream));
     } else {

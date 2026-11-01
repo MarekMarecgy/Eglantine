@@ -158,7 +158,9 @@ private:
     static constexpr VkDeviceSize DEFAULT_BUFFER_SIZE = 4 * sizeof(float);
 
     template <typename Func>
-    void PrepareDraw(bool is_indexed, Func&&);
+    void PrepareDraw(bool is_indexed, u32 direct_draw_instance_count, Func&&);
+
+    void AppendUnculledTrianglesForTerrainCullingShader(bool is_indexed, u32 instance_count);
 
     void FlushWork();
 

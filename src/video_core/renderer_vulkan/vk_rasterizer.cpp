@@ -61,6 +61,11 @@ using VideoCommon::ImageViewType;
 
 
 namespace {
+constexpr u32 TERRAIN_CULLING_INDEX_COUNTER_CBUF_OFFSET = 0x410;
+constexpr u32 TERRAIN_CULLING_INDEX_LIST_CBUF_OFFSET = 0x420;
+constexpr size_t TERRAIN_CULLING_MAX_APPENDED_INDICES = size_t{1} << 22;
+constexpr size_t GEOMETRY_STAGE_INDEX = 3;
+
 struct DrawParams {
     u32 base_instance;
     u32 num_instances;
@@ -243,7 +248,8 @@ RasterizerVulkan::~RasterizerVulkan() {
 }
 
 template <typename Func>
-void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+void RasterizerVulkan::PrepareDraw(bool is_indexed, u32 direct_draw_instance_count,
+                                   Func&& draw_func) {
 
     SCOPE_EXIT {
         gpu.TickWork();
@@ -278,10 +284,21 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         return pipeline_cache.CurrentGraphicsPipeline();
     }()};
     if (!pipeline) {
+        if (pipeline_cache.CurrentUnsupportedGeometryShaderHash() ==
+            DKB_TERRAIN_CULLING_GEOMETRY_SHADER_HASH) {
+            std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+            AppendUnculledTrianglesForTerrainCullingShader(is_indexed, direct_draw_instance_count);
+            submitted = true;
+            return;
+        }
         report_failure("no pipeline");
         return;
     }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    if (pipeline_cache.CurrentUnsupportedGeometryShaderHash() ==
+        DKB_TERRAIN_CULLING_GEOMETRY_SHADER_HASH) {
+        AppendUnculledTrianglesForTerrainCullingShader(is_indexed, direct_draw_instance_count);
+    }
     // Donkey Kong Bananza's terrain: a GPU program run over points resets each rock/dirt piece's
     // 5-word indirect draw record ({triangles 0, copies 1, 0, 0, 0}) through the pointers in a list
     // (c0[0x110]). Stores through addresses loaded from memory can't be mapped onto a storage
@@ -508,6 +525,113 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 }
 } // Anonymous namespace
 
+void RasterizerVulkan::AppendUnculledTrianglesForTerrainCullingShader(bool is_indexed,
+                                                                      u32 instance_count) {
+    static u32 terrain_culling_warnings{};
+    const auto warn_once = [](std::string_view reason) {
+        if (terrain_culling_warnings < 8) {
+            ++terrain_culling_warnings;
+            LOG_WARNING(HW_GPU, "Terrain culling geometry shader not emulated: {}", reason);
+        }
+    };
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    if (instance_count == 0) {
+        warn_once("indirect draw");
+        return;
+    }
+    if (draw_state.topology != Maxwell::PrimitiveTopology::Triangles) {
+        warn_once(fmt::format("topology {}", static_cast<u32>(draw_state.topology)));
+        return;
+    }
+    const auto& geometry_cbuf0 = maxwell3d->state.shader_stages[GEOMETRY_STAGE_INDEX].const_buffers[0];
+    if (!geometry_cbuf0.enabled ||
+        geometry_cbuf0.size < TERRAIN_CULLING_INDEX_LIST_CBUF_OFFSET + sizeof(u64)) {
+        warn_once("constant buffer 0 of the geometry stage is not bound");
+        return;
+    }
+    const GPUVAddr index_counter_address =
+        gpu_memory->Read<u64>(geometry_cbuf0.address + TERRAIN_CULLING_INDEX_COUNTER_CBUF_OFFSET);
+    const GPUVAddr index_list_address =
+        gpu_memory->Read<u64>(geometry_cbuf0.address + TERRAIN_CULLING_INDEX_LIST_CBUF_OFFSET);
+    if (!gpu_memory->IsFullyMappedRange(index_counter_address, sizeof(u32))) {
+        warn_once(fmt::format("index counter {:#x} is not mapped", index_counter_address));
+        return;
+    }
+
+    const auto read_coherent = [this](GPUVAddr address, void* destination, size_t size) {
+        if (gpu_memory->IsMemoryDirty(address, size, VideoCommon::CacheType::BufferCache)) {
+            gpu_memory->FlushRegion(address, size, VideoCommon::CacheType::BufferCache);
+        }
+        gpu_memory->ReadBlockUnsafe(address, destination, size);
+    };
+
+    const u32 vertex_count = is_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
+    const size_t triangle_vertex_count = vertex_count - vertex_count % 3;
+    if (triangle_vertex_count == 0) {
+        return;
+    }
+    std::vector<u32> vertex_ids(triangle_vertex_count);
+    if (is_indexed) {
+        const auto& index_buffer = draw_state.index_buffer;
+        const size_t index_size = index_buffer.FormatSizeInBytes();
+        const size_t index_bytes = triangle_vertex_count * index_size;
+        if (!gpu_memory->IsFullyMappedRange(index_buffer.IndexStart(), index_bytes)) {
+            warn_once(fmt::format("index buffer {:#x} is not mapped", index_buffer.IndexStart()));
+            return;
+        }
+        std::vector<u8> index_data(index_bytes);
+        read_coherent(index_buffer.IndexStart(), index_data.data(), index_bytes);
+        for (size_t vertex = 0; vertex < triangle_vertex_count; ++vertex) {
+            u32 index{};
+            std::memcpy(&index, index_data.data() + vertex * index_size, index_size);
+            vertex_ids[vertex] = index + draw_state.base_index;
+        }
+    } else {
+        for (size_t vertex = 0; vertex < triangle_vertex_count; ++vertex) {
+            vertex_ids[vertex] = draw_state.vertex_buffer.first + static_cast<u32>(vertex);
+        }
+    }
+
+    const size_t appended_index_count = triangle_vertex_count * instance_count;
+    if (appended_index_count > TERRAIN_CULLING_MAX_APPENDED_INDICES) {
+        warn_once(fmt::format("{} indices exceed the limit", appended_index_count));
+        return;
+    }
+    std::vector<u16> appended_indices;
+    appended_indices.reserve(appended_index_count);
+    for (u32 instance = 0; instance < instance_count; ++instance) {
+        for (const u32 vertex_id : vertex_ids) {
+            appended_indices.push_back(static_cast<u16>((std::min)(vertex_id, u32{0xffff})));
+        }
+    }
+
+    u32 index_counter{};
+    read_coherent(index_counter_address, &index_counter, sizeof(index_counter));
+    const GPUVAddr append_address = index_list_address + u64{index_counter} * sizeof(u16);
+    const size_t append_bytes = appended_indices.size() * sizeof(u16);
+    if (!gpu_memory->IsFullyMappedRange(append_address, append_bytes)) {
+        warn_once(fmt::format("index list {:#x}+{:#x} is not mapped", append_address, append_bytes));
+        return;
+    }
+    AccelerateInlineToMemory(
+        append_address, append_bytes,
+        std::span<const u8>{reinterpret_cast<const u8*>(appended_indices.data()), append_bytes});
+    const u32 new_index_counter = index_counter + static_cast<u32>(appended_indices.size());
+    AccelerateInlineToMemory(
+        index_counter_address, sizeof(new_index_counter),
+        std::span<const u8>{reinterpret_cast<const u8*>(&new_index_counter), sizeof(new_index_counter)});
+
+    static u32 terrain_culling_logs{};
+    if (terrain_culling_logs < 8) {
+        ++terrain_culling_logs;
+        LOG_INFO(HW_GPU,
+                 "Terrain culling geometry shader emulated: {} indices appended at {:#x}, "
+                 "counter {:#x} {} -> {}",
+                 appended_indices.size(), append_address, index_counter_address, index_counter,
+                 new_index_counter);
+    }
+}
+
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     TraceWindowTarget(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw",
@@ -619,7 +743,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                      regs.blend.enable[0], seen.size());
         }
     }
-    PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
+    PrepareDraw(is_indexed, instance_count, [this, is_indexed, instance_count] {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
         const u32 num_instances{instance_count};
         const DrawParams draw_params{MakeDrawParams(draw_state, num_instances, is_indexed)};
@@ -655,7 +779,7 @@ void RasterizerVulkan::DrawIndirect() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const auto& params = maxwell3d->draw_manager.indirect_state;
     buffer_cache.SetDrawIndirect(&params);
-    PrepareDraw(params.is_indexed, [this, &params] {
+    PrepareDraw(params.is_indexed, 0, [this, &params] {
         const auto indirect_buffer = buffer_cache.GetDrawIndirectBuffer();
         const auto& buffer = indirect_buffer.first;
         const auto& offset = indirect_buffer.second;

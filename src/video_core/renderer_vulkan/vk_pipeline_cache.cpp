@@ -212,6 +212,9 @@ Shader::TessSpacing MaxwellToTessSpacing(u32 raw) {
 
 Shader::AttributeType ColorOutputType(u8 render_target_format) {
     const auto format = static_cast<Tegra::RenderTargetFormat>(render_target_format);
+    if (format == Tegra::RenderTargetFormat::NONE) {
+        return Shader::AttributeType::Float;
+    }
     const auto pixel_format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(format);
     if (!VideoCore::Surface::IsPixelFormatInteger(pixel_format)) {
         return Shader::AttributeType::Float;
@@ -774,6 +777,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             return;
         }
 
+        if (NeedsMissingGeometryStage(key)) {
+            return;
+        }
+
         workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback]() mutable {
             ShaderPools pools;
             boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
@@ -908,17 +915,43 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     auto it{graphics_cache.find(graphics_key)};
     if (it == graphics_cache.end()) {
         ReportNewPipelineKey(graphics_key);
-        it = graphics_cache.emplace(graphics_key, BuildNewGraphicsPipeline()).first;
+        if (NeedsMissingGeometryStage(graphics_key) &&
+            graphics_key.unique_hashes[static_cast<size_t>(Maxwell::ShaderType::Geometry)] ==
+                DKB_TERRAIN_CULLING_GEOMETRY_SHADER_HASH) {
+            it = graphics_cache.emplace(graphics_key, CreateGraphicsPipelineWithoutGeometryStage())
+                     .first;
+        } else if (NeedsMissingGeometryStage(graphics_key)) {
+            LOG_WARNING(Render_Vulkan,
+                        "Skipping pipeline {:#016x}: it has a geometry shader and the device "
+                        "has none",
+                        graphics_key.Hash());
+            it = graphics_cache.emplace(graphics_key, nullptr).first;
+        } else {
+            it = graphics_cache.emplace(graphics_key, BuildNewGraphicsPipeline()).first;
+        }
     }
     auto& pipeline{it->second};
     if (!pipeline) {
         return nullptr;
     }
     if (current_pipeline) {
-        current_pipeline->AddTransition(pipeline.get());
+        current_pipeline->AddTransition(it->first, pipeline.get());
     }
     current_pipeline = pipeline.get();
     return BuiltPipeline(current_pipeline);
+}
+
+bool PipelineCache::NeedsMissingGeometryStage(const GraphicsPipelineCacheKey& key) const {
+    constexpr size_t geometry_program_index{
+        static_cast<size_t>(Maxwell::ShaderType::Geometry)};
+    return key.unique_hashes[geometry_program_index] != 0 && !device.IsGeometryShaderSupported();
+}
+
+u64 PipelineCache::CurrentUnsupportedGeometryShaderHash() const {
+    if (!NeedsMissingGeometryStage(graphics_key)) {
+        return 0;
+    }
+    return graphics_key.unique_hashes[static_cast<size_t>(Maxwell::ShaderType::Geometry)];
 }
 
 GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const noexcept {
@@ -1264,6 +1297,20 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     }
     SerializeGraphicsPipeline(graphics_key, std::move(environments.envs));
     QueueVulkanPipelineCacheFlush();
+    return pipeline;
+}
+
+std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipelineWithoutGeometryStage() {
+    GraphicsPipelineCacheKey key_without_geometry_stage{graphics_key};
+    key_without_geometry_stage.unique_hashes[static_cast<size_t>(Maxwell::ShaderType::Geometry)] = 0;
+    GraphicsEnvironments environments;
+    GetGraphicsEnvironments(environments, key_without_geometry_stage.unique_hashes);
+    main_pools.ReleaseContents();
+    auto pipeline{CreateGraphicsPipeline(main_pools, key_without_geometry_stage,
+                                         environments.Span(), nullptr, true)};
+    LOG_INFO(Render_Vulkan,
+             "Pipeline {:#016x} built without its geometry stage, which the device lacks: {}",
+             graphics_key.Hash(), pipeline ? "ok" : "failed");
     return pipeline;
 }
 

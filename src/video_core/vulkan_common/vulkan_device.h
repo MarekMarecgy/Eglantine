@@ -435,6 +435,10 @@ FN_MAX_LIMIT_LIST
         return features.descriptor_indexing.shaderStorageTexelBufferArrayNonUniformIndexing;
     }
 
+    bool IsGeometryShaderSupported() const {
+        return features.features.geometryShader;
+    }
+
     /// Returns true if the device supports float64 natively.
     bool IsFloat64Supported() const {
         return features.features.shaderFloat64;
