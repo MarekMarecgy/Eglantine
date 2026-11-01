@@ -1692,6 +1692,43 @@ private:
         }
     }
 
+    // EDEN_NX2_VDEC_EOS_WAIT=1: an image released after the end of a stream waits for the next
+    // Start like any other handed-out image (its fence is a future value), instead of completing
+    // at once with a repeat of the end-of-stream frame.
+    static bool EndOfStreamReleasesWait() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_VDEC_EOS_WAIT");
+            return value != nullptr && value[0] == '1';
+        }();
+        return enabled;
+    }
+
+    // EDEN_NX2_VDEC_TRACE=1: log every change to which images the client and the decoder hold
+    // (finds an image handed to the client twice). Call with m_mutex held.
+    static bool TraceEnabled() {
+        static const bool enabled = std::getenv("EDEN_NX2_VDEC_TRACE") != nullptr;
+        return enabled;
+    }
+
+    std::string TraceStateLocked() const {
+        std::vector<u32> outputs;
+        for (const auto& output : m_outputs) {
+            outputs.push_back(output.image);
+        }
+        return fmt::format("free [{}] outputs [{}] repeat [{}] handed {} base {:#x} ended {}",
+                           fmt::join(m_free, ","), fmt::join(outputs, ","),
+                           fmt::join(m_images_released_after_end_of_stream, ","), m_handed,
+                           m_sync_base, m_stream_ended);
+    }
+
+    template <typename... Args>
+    void TraceLocked(fmt::format_string<Args...> format, Args&&... args) {
+        if (TraceEnabled()) {
+            LOG_INFO(Service, "{} trace: {} | {}", GetServiceName(),
+                     fmt::format(format, std::forward<Args>(args)...), TraceStateLocked());
+        }
+    }
+
     Nvidia::NvCore::SyncpointManager& NvdrvSyncpoints() {
         return system.ServiceManager()
             .GetService<Nvidia::NVDRV>("nvdrv", true)
@@ -1716,6 +1753,14 @@ private:
         Log(ctx, "start");
         const u32 counter_id = w[3];
         const u32 start_value = w[4];
+        if (TraceEnabled()) {
+            std::scoped_lock lk{m_mutex};
+            TraceLocked("start counter {:#x} value {:#x} reached {:#x}", counter_id, start_value,
+                        m_syncpoint == NoSyncpoint
+                            ? 0U
+                            : system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(
+                                  m_syncpoint));
+        }
         if (m_syncpoint != NoSyncpoint && counter_id == ~m_syncpoint) {
             CompleteHandedOutImagesUpTo(start_value);
         }
@@ -1735,6 +1780,7 @@ private:
                     m_release_fences.erase(image);
                     m_outputs.push_back({image, m_width, m_height, 0, false});
                     ++images_completed;
+                    TraceLocked("start completes image {}", image);
                 }
                 syncpoints.IncrementGuest(m_syncpoint);
                 ++reached;
@@ -1816,7 +1862,8 @@ private:
             // once: its fence is the syncpoint's current value. Mario Kart World releases its
             // images after a movie ends and waits for the returned fences; a fence for a frame
             // that never comes hung the game on a black screen after its title movie.
-            if (release_fence && m_stream_ended && m_inputs.empty() && m_decoded.empty()) {
+            if (release_fence && m_stream_ended && m_inputs.empty() && m_decoded.empty() &&
+                !EndOfStreamReleasesWait()) {
                 const u32 reached = static_cast<u32>(
                     system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(m_syncpoint));
                 m_sync_base = reached;
@@ -1830,6 +1877,8 @@ private:
                 }
                 value = m_sync_base + ++m_handed;
             }
+            TraceLocked("{} image {} -> value {:#x}", release_fence ? "release" : "register", image,
+                        value);
         }
         m_cv.notify_one();
         return {~m_syncpoint, 0, value, 0};
@@ -1855,6 +1904,7 @@ private:
             std::scoped_lock lk{m_mutex};
             std::erase(m_free, image);
             m_release_fences.erase(image);
+            TraceLocked("unregister image {}", image);
         }
         TipcReplyWords(ctx, {});
     }
@@ -1872,6 +1922,9 @@ private:
         }
         {
             std::scoped_lock lk{m_mutex};
+            if (end || m_stream_ended) {
+                TraceLocked("submit pts {} end {}", pts, end);
+            }
             m_inputs.push_back(std::move(input));
             m_stream_ended = false;
             m_images_released_after_end_of_stream.clear();
@@ -1893,6 +1946,7 @@ private:
             m_stream_ended = false;
             m_images_released_after_end_of_stream.clear();
             m_ready->room.store(true, std::memory_order_relaxed);
+            TraceLocked("{}", ctx.GetCommand() == 8 ? "flush" : "stop");
         }
         m_cv.notify_one();
         TipcReplyWords(ctx, {});
@@ -1913,6 +1967,9 @@ private:
                 m_images_released_after_end_of_stream.pop_front();
                 LOG_INFO(Service, "{} repeats the end-of-stream frame in released image {}",
                           GetServiceName(), output->image);
+            }
+            if (output) {
+                TraceLocked("output image {} end {}", output->image, output->end);
             }
         }
         if (!output) {
@@ -1974,6 +2031,7 @@ private:
                 lk.lock();
                 // Even an image written during a flush counts: the client waits for its value.
                 m_outputs.push_back({image, width, height, frame.pts, frame.end});
+                TraceLocked("decoded into image {} end {}", image, frame.end);
                 if (frame.end) {
                     m_stream_ended = true;
                     m_end_of_stream_output = m_outputs.back();
