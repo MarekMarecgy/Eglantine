@@ -7,6 +7,8 @@
 #pragma once
 
 #include <array>
+#include <span>
+#include <unordered_map>
 
 #include <boost/container/static_vector.hpp>
 
@@ -161,6 +163,8 @@ private:
     void PrepareDraw(bool is_indexed, u32 direct_draw_instance_count, Func&&);
 
     void AppendUnculledTrianglesForTerrainCullingShader(bool is_indexed, u32 instance_count);
+    void ResetTerrainCullingDrawRecords(std::span<const u64> record_addresses);
+    void WritePendingTerrainCullingRecordResets();
 
     void FlushWork();
 
@@ -234,6 +238,7 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
+    std::unordered_map<GPUVAddr, Tegra::MemoryManager*> terrain_culling_records_pending_reset;
 };
 
 } // namespace Vulkan

@@ -358,22 +358,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, u32 direct_draw_instance_cou
                 }
                 std::vector<u64> pointers(count);
                 gpu_memory->ReadBlockUnsafe(list_begin, pointers.data(), list_bytes);
-                static constexpr std::array<u32, 5> record{0, 1, 0, 0, 0};
-                const std::span<const u8> bytes{reinterpret_cast<const u8*>(record.data()),
-                                                sizeof(record)};
-                u32 written = 0;
-                for (const u64 pointer : pointers) {
-                    if (pointer == 0 || !gpu_memory->IsFullyMappedRange(pointer, sizeof(record))) {
-                        continue;
-                    }
-                    AccelerateInlineToMemory(pointer, sizeof(record), bytes);
-                    ++written;
-                }
+                ResetTerrainCullingDrawRecords(pointers);
                 static u32 reset_logs{};
                 if (reset_logs < 5) {
                     ++reset_logs;
-                    LOG_INFO(HW_GPU, "Indirect draw reset: list {:#x}, {} records ({} written)",
-                             list_begin, count, written);
+                    LOG_INFO(HW_GPU, "Indirect draw reset: list {:#x}, {} records", list_begin,
+                             count);
                 }
             }
             submitted = true;
@@ -605,21 +595,34 @@ void RasterizerVulkan::AppendUnculledTrianglesForTerrainCullingShader(bool is_in
         }
     }
 
-    u32 index_counter{};
-    read_coherent(index_counter_address, &index_counter, sizeof(index_counter));
+    u32 stored_index_counter{};
+    read_coherent(index_counter_address, &stored_index_counter, sizeof(stored_index_counter));
+    u32 index_counter = stored_index_counter;
+    if (const auto pending_reset = terrain_culling_records_pending_reset.find(index_counter_address);
+        pending_reset != terrain_culling_records_pending_reset.end() &&
+        pending_reset->second == gpu_memory) {
+        index_counter = 0;
+        terrain_culling_records_pending_reset.erase(pending_reset);
+    }
     const GPUVAddr append_address = index_list_address + u64{index_counter} * sizeof(u16);
     const size_t append_bytes = appended_indices.size() * sizeof(u16);
     if (!gpu_memory->IsFullyMappedRange(append_address, append_bytes)) {
         warn_once(fmt::format("index list {:#x}+{:#x} is not mapped", append_address, append_bytes));
         return;
     }
-    AccelerateInlineToMemory(
-        append_address, append_bytes,
-        std::span<const u8>{reinterpret_cast<const u8*>(appended_indices.data()), append_bytes});
+    std::vector<u16> stored_indices(appended_indices.size());
+    read_coherent(append_address, stored_indices.data(), append_bytes);
+    if (stored_indices != appended_indices) {
+        AccelerateInlineToMemory(
+            append_address, append_bytes,
+            std::span<const u8>{reinterpret_cast<const u8*>(appended_indices.data()), append_bytes});
+    }
     const u32 new_index_counter = index_counter + static_cast<u32>(appended_indices.size());
-    AccelerateInlineToMemory(
-        index_counter_address, sizeof(new_index_counter),
-        std::span<const u8>{reinterpret_cast<const u8*>(&new_index_counter), sizeof(new_index_counter)});
+    if (new_index_counter != stored_index_counter) {
+        AccelerateInlineToMemory(index_counter_address, sizeof(new_index_counter),
+                                 std::span<const u8>{reinterpret_cast<const u8*>(&new_index_counter),
+                                                     sizeof(new_index_counter)});
+    }
 
     static u32 terrain_culling_logs{};
     if (terrain_culling_logs < 8) {
@@ -630,6 +633,46 @@ void RasterizerVulkan::AppendUnculledTrianglesForTerrainCullingShader(bool is_in
                  appended_indices.size(), append_address, index_counter_address, index_counter,
                  new_index_counter);
     }
+}
+
+void RasterizerVulkan::ResetTerrainCullingDrawRecords(std::span<const u64> record_addresses) {
+    static constexpr std::array<u32, 5> reset_record{0, 1, 0, 0, 0};
+    const std::span<const u8> reset_record_bytes{reinterpret_cast<const u8*>(reset_record.data()),
+                                                 sizeof(reset_record)};
+    for (const GPUVAddr record_address : record_addresses) {
+        if (record_address == 0 ||
+            !gpu_memory->IsFullyMappedRange(record_address, sizeof(reset_record))) {
+            continue;
+        }
+        if (gpu_memory->IsMemoryDirty(record_address, sizeof(reset_record),
+                                      VideoCommon::CacheType::BufferCache)) {
+            gpu_memory->FlushRegion(record_address, sizeof(reset_record),
+                                    VideoCommon::CacheType::BufferCache);
+        }
+        std::array<u32, 5> stored_record{};
+        gpu_memory->ReadBlockUnsafe(record_address, stored_record.data(), sizeof(stored_record));
+        if (stored_record == reset_record) {
+            continue;
+        }
+        const bool only_index_count_differs =
+            std::equal(stored_record.begin() + 1, stored_record.end(), reset_record.begin() + 1);
+        if (only_index_count_differs) {
+            terrain_culling_records_pending_reset.insert_or_assign(record_address, gpu_memory);
+            continue;
+        }
+        AccelerateInlineToMemory(record_address, sizeof(reset_record), reset_record_bytes);
+    }
+}
+
+void RasterizerVulkan::WritePendingTerrainCullingRecordResets() {
+    if (terrain_culling_records_pending_reset.empty()) {
+        return;
+    }
+    static constexpr u32 reset_index_count = 0;
+    for (const auto& [record_address, memory_manager] : terrain_culling_records_pending_reset) {
+        memory_manager->WriteBlock(record_address, &reset_index_count, sizeof(reset_index_count));
+    }
+    terrain_culling_records_pending_reset.clear();
 }
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
@@ -1448,6 +1491,7 @@ void RasterizerVulkan::FlushCommands() {
 
 void RasterizerVulkan::TickFrame() {
     draw_counter = 0;
+    WritePendingTerrainCullingRecordResets();
     guest_descriptor_queue.TickFrame();
     compute_pass_descriptor_queue.TickFrame();
     descriptor_buffer_ring.TickFrame();

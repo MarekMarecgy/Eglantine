@@ -13,6 +13,7 @@
 
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/readback_diagnostics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 
@@ -36,7 +37,7 @@ VkBufferCopy MakeBufferCopy(const VideoCommon::BufferCopy& copy) {
 }
 
 VkIndexType IndexTypeFromNumElements(const Device& device, u32 num_elements) {
-    if (num_elements <= 0xff && device.IsExtIndexTypeUint8Supported()) {
+    if (num_elements <= 0xff && device.IsExtIndexTypeUint8Supported() && !device.IsMoltenVK()) {
         return VK_INDEX_TYPE_UINT8_EXT;
     }
     if (num_elements <= 0xffff) {
@@ -645,6 +646,31 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
     }
     scheduler.Record([vk_buffer, vk_offset, vk_index_type](vk::CommandBuffer cmdbuf) {
         cmdbuf.BindIndexBuffer(vk_buffer, vk_offset, vk_index_type);
+    });
+}
+
+bool BufferCacheRuntime::CanConvertUint8IndicesOnCpu(u32 size) const {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_CPU_UINT8");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled && device.IsMoltenVK() && size != 0 && size <= 64 * 1024;
+}
+
+void BufferCacheRuntime::BindCpuConvertedUint8IndexBuffer(std::span<const u8> indices,
+                                                        bool primitive_restart) {
+    VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::CpuUint8IndexConversions, 1);
+    VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::CpuUint8IndexBytes, indices.size());
+    converted_uint8_indices.resize(indices.size());
+    std::ranges::transform(indices, converted_uint8_indices.begin(),
+                           [primitive_restart](u8 index) -> u16 {
+                               return primitive_restart && index == 0xff ? 0xffff : index;
+                           });
+    const size_t converted_size = converted_uint8_indices.size() * sizeof(u16);
+    const auto staging = staging_pool.Request(converted_size, MemoryUsage::Upload);
+    std::memcpy(staging.mapped_span.data(), converted_uint8_indices.data(), converted_size);
+    scheduler.Record([buffer = staging.buffer, offset = staging.offset](vk::CommandBuffer cmdbuf) {
+        cmdbuf.BindIndexBuffer(buffer, offset, VK_INDEX_TYPE_UINT16);
     });
 }
 

@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -16,6 +17,7 @@
 #include "common/settings.h"
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/readback_diagnostics.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -111,10 +113,37 @@ void Scheduler::DispatchWork() {
     }
 }
 
+namespace {
+void CountRenderPassForProfile(VkExtent2D render_area, u32 attachment_count) {
+    if (!VideoCommon::Nx2Profile::Enabled()) {
+        return;
+    }
+    static u64 render_passes_begun{};
+    static u64 attachment_megapixels_x1000{};
+    static auto report_started = std::chrono::steady_clock::now();
+    ++render_passes_begun;
+    attachment_megapixels_x1000 +=
+        u64{render_area.width} * render_area.height * attachment_count / 1000;
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed_seconds = std::chrono::duration<double>(now - report_started).count();
+    if (elapsed_seconds < 10.0) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan,
+             "Render passes per second: {:.0f}, attachment area per second: {:.0f} megapixels",
+             render_passes_begun / elapsed_seconds,
+             attachment_megapixels_x1000 / 1000.0 / elapsed_seconds);
+    render_passes_begun = 0;
+    attachment_megapixels_x1000 = 0;
+    report_started = now;
+}
+} // Anonymous namespace
+
 void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass renderpass,
                                     const VkClearValue* clear_values, u32 clear_value_count) {
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
+    CountRenderPassForProfile(render_area, framebuffer->NumImages());
     state.renderpass = renderpass;
     state.framebuffer = framebuffer_handle;
     state.render_area = render_area;

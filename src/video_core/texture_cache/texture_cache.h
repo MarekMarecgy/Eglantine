@@ -358,7 +358,16 @@ typename P::ImageView& TextureCache<P>::GetImageView(u32 index) noexcept {
 
 template <class P>
 void TextureCache<P>::MarkModification(ImageId id) noexcept {
-    MarkModification(slot_images[id]);
+    static constexpr size_t MAX_SHADER_WRITTEN_FENCE_DOWNLOAD_BYTES = 64 * 1024;
+    ImageBase& image = slot_images[id];
+    MarkModification(image);
+    const bool read_by_guest_cpu_before = image.info.forced_flushed;
+    const bool downloadable =
+        False(image.flags & (ImageFlagBits::Unbacked | ImageFlagBits::TrimmedLevels)) &&
+        image.guest_size_bytes <= MAX_SHADER_WRITTEN_FENCE_DOWNLOAD_BYTES;
+    if (read_by_guest_cpu_before && downloadable) {
+        uncommitted_downloads.emplace_back(PendingDownload{true, 0, id});
+    }
 }
 
 template <class P>

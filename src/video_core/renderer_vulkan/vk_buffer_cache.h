@@ -153,6 +153,10 @@ public:
 
     void BindQuadIndexBuffer(PrimitiveTopology topology, u32 first, u32 count);
 
+    bool CanConvertUint8IndicesOnCpu(u32 size) const;
+
+    void BindCpuConvertedUint8IndexBuffer(std::span<const u8> indices, bool primitive_restart);
+
     void BindVertexBuffer(u32 index, VkBuffer buffer, u32 offset, u32 size, u32 stride);
 
     void BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bindings);
@@ -268,6 +272,7 @@ private:
     vk::Buffer null_buffer;
 
     std::unique_ptr<Uint8Pass> uint8_pass;
+    std::vector<u16> converted_uint8_indices;
     QuadIndexedPass quad_index_pass;
 
     MultiRangeBufferCache multi_range_buffers;

@@ -844,6 +844,22 @@ void BufferCache<P>::BindHostIndexBuffer() {
     const u32 offset = buffer.Offset(channel_state->index_buffer.device_addr);
     const u32 size = channel_state->index_buffer.size;
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    if constexpr (!IS_OPENGL) {
+        const bool can_convert_uint8_indices =
+            draw_state.index_buffer.format == Maxwell::IndexFormat::UnsignedByte &&
+            draw_state.topology != Maxwell::PrimitiveTopology::Quads &&
+            draw_state.topology != Maxwell::PrimitiveTopology::QuadStrip &&
+            draw_state.inline_index_draw_indexes.empty() &&
+            u64{draw_state.index_buffer.first} + draw_state.index_buffer.count <= size &&
+            runtime.CanConvertUint8IndicesOnCpu(size);
+        if (can_convert_uint8_indices &&
+            !IsRegionGpuModified(channel_state->index_buffer.device_addr, size)) {
+            runtime.BindCpuConvertedUint8IndexBuffer(
+                ImmediateBufferWithData(channel_state->index_buffer.device_addr, size),
+                maxwell3d->regs.primitive_restart.enabled != 0);
+            return;
+        }
+    }
     if (draw_state.inline_index_draw_indexes.empty()) {
         SynchronizeBuffer(buffer, channel_state->index_buffer.device_addr, size);
     } else {

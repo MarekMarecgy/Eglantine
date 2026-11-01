@@ -78,7 +78,7 @@ inline u64 Now() {
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 8> counters{}; ///< See Counter
+    std::array<u64, 10> counters{}; ///< See Counter
     u64 child_ns{};    ///< Time of the zones nested in the current one
     u64 window_start{};
 };
@@ -128,6 +128,8 @@ enum class Counter : u32 {
     SameValueWrites, ///< Of MethodWrites: the register already held the value
     AcquireChecks,  ///< Semaphore acquires evaluated
     AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
+    CpuUint8IndexConversions,
+    CpuUint8IndexBytes,
 };
 
 /// Device pages (4 KiB) the native MME has DMA-read since start (GPU thread only; filled only
@@ -188,6 +190,9 @@ inline void Report(const char* thread_name = "GPU thread") {
     line += fmt::format(" | acquires {:.0f} ({:.0f} waited)",
                         static_cast<double>(data.counters[6]) * 1e9 / window,
                         static_cast<double>(data.counters[7]) * 1e9 / window);
+    line += fmt::format(" | CPU uint8 index conversions {:.0f} ({:.0f} KiB)",
+                        static_cast<double>(data.counters[8]) * 1e9 / window,
+                        static_cast<double>(data.counters[9]) * 1e9 / 1024.0 / window);
     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
     data = {};
     data.window_start = now;
