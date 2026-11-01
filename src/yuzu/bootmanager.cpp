@@ -68,6 +68,10 @@
 #include "qt_common/render/context.h"
 #include "qt_common/render/emu_thread.h"
 
+#ifdef __APPLE__
+#include "qt_common/render/metal_present_layer.h"
+#endif
+
 class QObject;
 class QPaintEngine;
 class QSurface;
@@ -190,6 +194,12 @@ void GRenderWindow::OnFramebufferSizeChanged() {
     const u32 width = this->width() * pixel_ratio;
     const u32 height = this->height() * pixel_ratio;
     UpdateCurrentFramebufferLayout(width, height);
+#ifdef __APPLE__
+    if (child_widget != nullptr && child_widget->internalWinId() != 0) {
+        QtCommon::Render::FitMetalPresentLayerToView(
+            reinterpret_cast<void*>(child_widget->internalWinId()));
+    }
+#endif
 }
 
 void GRenderWindow::BackupGeometry() {

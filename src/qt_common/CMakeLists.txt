@@ -92,6 +92,11 @@ if (ENABLE_OPENGL)
     target_compile_definitions(qt_common PUBLIC HAS_OPENGL)
 endif()
 
+if (APPLE)
+    target_sources(qt_common PRIVATE render/metal_present_layer.h render/metal_present_layer.mm)
+    target_link_libraries(qt_common PRIVATE "-framework AppKit" "-framework QuartzCore")
+endif()
+
 if (UNIX AND NOT APPLE)
     if (DEFINED Qt6Gui_PRIVATE_INCLUDE_DIRS)
         target_include_directories(qt_common PRIVATE ${Qt6Gui_PRIVATE_INCLUDE_DIRS})
