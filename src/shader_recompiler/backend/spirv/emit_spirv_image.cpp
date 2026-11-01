@@ -238,20 +238,29 @@ private:
     spv::ImageOperandsMask mask{};
 };
 
+Id LoadSampledImage(EmitContext& ctx, const TextureDefinition& def, Id pointer) {
+    if (!def.uses_shared_sampler) {
+        return ctx.OpLoad(def.sampled_type, pointer);
+    }
+    const Id image{ctx.OpLoad(def.image_type, pointer)};
+    const Id sampler{ctx.OpLoad(ctx.sampler_type, ctx.shared_sampler)};
+    return ctx.OpSampledImage(def.sampled_type, image, sampler);
+}
+
 Id Texture(EmitContext& ctx, IR::TextureInstInfo info, [[maybe_unused]] const IR::Value& index) {
     const TextureDefinition& def{ctx.textures.at(info.descriptor_index)};
     if (def.count > 1) {
         auto const idx = index.IsImmediate() ? ctx.Const(index.U32()) : ctx.Def(index);
         const bool non_uniform{MarkNonUniform(ctx, idx, index, NonUniformKind::SampledImage)};
         const Id pointer{ctx.OpAccessChain(def.pointer_type, def.id, idx)};
-        const Id object{ctx.OpLoad(def.sampled_type, pointer)};
+        const Id object{LoadSampledImage(ctx, def, pointer)};
         if (non_uniform) {
             DecorateNonUniform(ctx, pointer);
             DecorateNonUniform(ctx, object);
         }
         return object;
     } else {
-        return ctx.OpLoad(def.sampled_type, def.id);
+        return LoadSampledImage(ctx, def, def.id);
     }
 }
 
@@ -277,6 +286,14 @@ Id TextureImage(EmitContext& ctx, IR::TextureInstInfo info, const IR::Value& ind
             auto const idx = index.IsImmediate() ? ctx.Const(index.U32()) : ctx.Def(index);
             const bool non_uniform{MarkNonUniform(ctx, idx, index, NonUniformKind::SampledImage)};
             const Id ptr = ctx.OpAccessChain(def.pointer_type, def.id, idx);
+            if (def.uses_shared_sampler) {
+                const Id image = ctx.OpLoad(def.image_type, ptr);
+                if (non_uniform) {
+                    DecorateNonUniform(ctx, ptr);
+                    DecorateNonUniform(ctx, image);
+                }
+                return image;
+            }
             const Id object = ctx.OpLoad(def.sampled_type, ptr);
             const Id image = ctx.OpImage(def.image_type, object);
             if (non_uniform) {
@@ -285,6 +302,9 @@ Id TextureImage(EmitContext& ctx, IR::TextureInstInfo info, const IR::Value& ind
                 DecorateNonUniform(ctx, image);
             }
             return image;
+        }
+        if (def.uses_shared_sampler) {
+            return ctx.OpLoad(def.image_type, def.id);
         }
         return ctx.OpImage(def.image_type, ctx.OpLoad(def.sampled_type, def.id));
     }

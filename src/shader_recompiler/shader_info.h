@@ -349,4 +349,22 @@ u32 NumDescriptors(const Descriptors& descriptors) {
     return num;
 }
 
+constexpr u32 METAL_MAX_SAMPLERS_PER_STAGE = 16;
+
+[[nodiscard]] inline size_t FirstSharedSamplerTexture(const TextureDescriptors& descriptors,
+                                                      u32 max_samplers_per_stage) {
+    if (max_samplers_per_stage == 0 || NumDescriptors(descriptors) <= max_samplers_per_stage) {
+        return descriptors.size();
+    }
+    const u32 max_combined_samplers = max_samplers_per_stage - 1;
+    u32 combined_samplers{};
+    for (size_t index = 0; index < descriptors.size(); ++index) {
+        combined_samplers += descriptors[index].count;
+        if (combined_samplers > max_combined_samplers) {
+            return index;
+        }
+    }
+    return descriptors.size();
+}
+
 } // namespace Shader

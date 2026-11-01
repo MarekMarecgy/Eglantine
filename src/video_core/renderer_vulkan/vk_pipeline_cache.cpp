@@ -514,6 +514,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_scaled_attributes = !device.MustEmulateScaledFormats(),
         .support_multi_viewport = device.SupportsMultiViewport(),
         .support_geometry_streams = device.AreTransformFeedbackGeometryStreamsSupported(),
+        .max_samplers_per_stage = device.IsMoltenVK() ? Shader::METAL_MAX_SAMPLERS_PER_STAGE : 0u,
         .support_sampled_image_array_nonuniform_indexing =
             device.IsSampledImageArrayNonUniformIndexingSupported(),
         .support_storage_image_array_nonuniform_indexing =

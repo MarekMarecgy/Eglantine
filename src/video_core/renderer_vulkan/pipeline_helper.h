@@ -12,6 +12,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/common_types.h"
+#include "common/logging.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -271,11 +272,56 @@ public:
         Add(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage, info.storage_buffers_descriptors);
         Add(VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, stage, info.texture_buffer_descriptors);
         Add(VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, stage, info.image_buffer_descriptors);
-        Add(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage, info.texture_descriptors);
+        AddTextures(stage, info.texture_descriptors);
         Add(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage, info.image_descriptors);
     }
 
 private:
+    void AddTextures(VkShaderStageFlags stage, const Shader::TextureDescriptors& descriptors) {
+        const size_t first_shared_sampler_texture{Shader::FirstSharedSamplerTexture(
+            descriptors, device->IsMoltenVK() ? Shader::METAL_MAX_SAMPLERS_PER_STAGE : 0u)};
+        size_t shared_sampler_offset{};
+        for (size_t index = 0; index < descriptors.size(); ++index) {
+            const bool uses_shared_sampler{index >= first_shared_sampler_texture};
+            if (index == first_shared_sampler_texture) {
+                shared_sampler_offset = offset;
+            }
+            AddBinding(uses_shared_sampler ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
+                                           : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                       stage, descriptors[index].count, offset);
+            offset += sizeof(DescriptorUpdateEntry) * descriptors[index].count;
+        }
+        if (first_shared_sampler_texture < descriptors.size()) {
+            LOG_INFO(Render_Vulkan,
+                     "Stage 0x{:x} uses {} samplers, textures from index {} of {} share one "
+                     "sampler",
+                     stage, Shader::NumDescriptors(descriptors), first_shared_sampler_texture,
+                     descriptors.size());
+            AddBinding(VK_DESCRIPTOR_TYPE_SAMPLER, stage, 1, shared_sampler_offset);
+        }
+    }
+
+    void AddBinding(VkDescriptorType type, VkShaderStageFlags stage, u32 count,
+                    size_t entry_offset) {
+        bindings.push_back({
+            .binding = binding,
+            .descriptorType = type,
+            .descriptorCount = count,
+            .stageFlags = stage,
+            .pImmutableSamplers = nullptr,
+        });
+        entries.push_back({
+            .dstBinding = binding,
+            .dstArrayElement = 0,
+            .descriptorCount = count,
+            .descriptorType = type,
+            .offset = entry_offset,
+            .stride = sizeof(DescriptorUpdateEntry),
+        });
+        ++binding;
+        num_descriptors += count;
+    }
+
     template <typename Descriptors>
     void Add(VkDescriptorType type, VkShaderStageFlags stage, const Descriptors& descriptors) {
         const size_t num{descriptors.size()};

@@ -61,6 +61,7 @@ struct Profile {
     bool support_scaled_attributes{};
     bool support_multi_viewport{};
     bool support_geometry_streams{};
+    u32 max_samplers_per_stage{};
     bool support_sampled_image_array_nonuniform_indexing{};
     bool support_storage_image_array_nonuniform_indexing{};
     bool support_uniform_texel_buffer_array_nonuniform_indexing{};

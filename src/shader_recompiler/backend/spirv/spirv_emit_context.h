@@ -45,6 +45,7 @@ struct TextureDefinition {
     u32 count;
     bool is_multisample;
     bool is_integer;
+    bool uses_shared_sampler;
 };
 
 struct TextureBufferDefinition {
@@ -335,6 +336,9 @@ public:
     Id shared_memory_u64{};
     Id shared_memory_u32x2{};
     Id shared_memory_u32x4{};
+
+    Id sampler_type{};
+    Id shared_sampler{};
 
     Id shared_memory_u32_type{};
 

@@ -1375,11 +1375,16 @@ void EmitContext::DefineImageBuffers(const Info& info, u32& binding) {
 
 void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_index) {
     textures.reserve(info.texture_descriptors.size());
+    const size_t first_shared_sampler_texture{
+        FirstSharedSamplerTexture(info.texture_descriptors, profile.max_samplers_per_stage)};
+    size_t texture_index{};
     for (const TextureDescriptor& desc : info.texture_descriptors) {
+        const bool uses_shared_sampler{texture_index++ >= first_shared_sampler_texture};
         const Id image_type{ImageType(*this, desc)};
         const Id sampled_type{TypeSampledImage(image_type)};
-        const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, sampled_type)};
-        const Id desc_type{DescType(*this, sampled_type, pointer_type, desc.count)};
+        const Id bound_type{uses_shared_sampler ? image_type : sampled_type};
+        const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, bound_type)};
+        const Id desc_type{DescType(*this, bound_type, pointer_type, desc.count)};
         const Id id{AddGlobalVariable(desc_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
         Decorate(id, spv::Decoration::DescriptorSet, 0U);
@@ -1392,12 +1397,25 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
             .count = desc.count,
             .is_multisample = desc.is_multisample,
             .is_integer = desc.is_integer,
+            .uses_shared_sampler = uses_shared_sampler,
         });
         if (profile.supported_spirv >= 0x00010400) {
             interfaces.push_back(id);
         }
         ++binding;
         ++scaling_index;
+    }
+    if (first_shared_sampler_texture < info.texture_descriptors.size()) {
+        sampler_type = TypeSampler();
+        const Id sampler_pointer_type{TypePointer(spv::StorageClass::UniformConstant, sampler_type)};
+        shared_sampler = AddGlobalVariable(sampler_pointer_type, spv::StorageClass::UniformConstant);
+        Decorate(shared_sampler, spv::Decoration::Binding, binding);
+        Decorate(shared_sampler, spv::Decoration::DescriptorSet, 0U);
+        Name(shared_sampler, "shared_sampler");
+        if (profile.supported_spirv >= 0x00010400) {
+            interfaces.push_back(shared_sampler);
+        }
+        ++binding;
     }
     if (info.uses_atomic_image_u32) {
         image_u32 = TypePointer(spv::StorageClass::Image, U32[1]);
