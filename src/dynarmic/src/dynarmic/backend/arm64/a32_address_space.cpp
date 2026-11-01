@@ -118,9 +118,13 @@ static void* EmitExclusiveReadCallTrampoline(oaknut::CodeGenerator& code, const 
     oaknut::Label l_addr, l_this;
 
     auto fn = [](const A32::UserConfig& conf, A32::VAddr vaddr) -> T {
-        return conf.global_monitor->ReadAndMark<T>(conf.processor_id, vaddr, [&]() -> T {
+        const auto read = [&]() -> T {
             return (conf.callbacks->*callback)(vaddr, sizeof(T));
-        });
+        };
+        if (conf.HasOptimization(OptimizationFlag::Unsafe_IgnoreGlobalMonitor)) {
+            return conf.global_monitor->ReadAndMarkWithoutGlobalLock<T>(conf.processor_id, vaddr, read);
+        }
+        return conf.global_monitor->ReadAndMark<T>(conf.processor_id, vaddr, read);
     };
 
     void* target = code.xptr<void*>();
@@ -174,9 +178,13 @@ static void* EmitExclusiveWriteCallTrampoline(oaknut::CodeGenerator& code, const
     oaknut::Label l_addr, l_this;
 
     auto fn = [](const A32::UserConfig& conf, A32::VAddr vaddr, T value) -> u32 {
-        return conf.global_monitor->DoExclusiveOperation<T>(conf.processor_id, vaddr, [&](T expected) -> bool {
+        const auto write = [&](T expected) -> bool {
             return (conf.callbacks->*callback)(vaddr, value, expected);
-        }) ? 0 : 1;
+        };
+        if (conf.HasOptimization(OptimizationFlag::Unsafe_IgnoreGlobalMonitor)) {
+            return conf.global_monitor->DoExclusiveOperationWithoutGlobalLock<T>(conf.processor_id, vaddr, write) ? 0 : 1;
+        }
+        return conf.global_monitor->DoExclusiveOperation<T>(conf.processor_id, vaddr, write) ? 0 : 1;
     };
 
     void* target = code.xptr<void*>();

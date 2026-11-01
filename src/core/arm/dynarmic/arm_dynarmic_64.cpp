@@ -367,7 +367,10 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.unsafe_optimizations = true;
         config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA;
         config.fastmem_address_space_bits = 64;
-        config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
+        if (const char* global_monitor = std::getenv("EDEN_NX2_GLOBAL_MONITOR");
+            global_monitor == nullptr || global_monitor[0] != '1') {
+            config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
+        }
         break;
     // Paranoia mode for debugging optimizations
     case Settings::CpuAccuracy::Paranoid:

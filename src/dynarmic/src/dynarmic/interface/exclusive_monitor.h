@@ -9,6 +9,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -62,6 +63,30 @@ public:
 
         Unlock();
         return result;
+    }
+
+    template<typename T, typename Function>
+    T ReadAndMarkWithoutGlobalLock(size_t processor_id, VAddr address, Function op) {
+        static_assert(std::is_trivially_copyable_v<T>);
+        const T value = op();
+        std::memcpy(exclusive_values[processor_id].data(), &value, sizeof(T));
+        std::atomic_ref<VAddr>{exclusive_addresses[processor_id]}.store(
+            address & RESERVATION_GRANULE_MASK, std::memory_order_release);
+        return value;
+    }
+
+    template<typename T, typename Function>
+        requires std::is_trivially_copyable_v<T>
+    bool DoExclusiveOperationWithoutGlobalLock(size_t processor_id, VAddr address, Function op) {
+        const VAddr marked_address = std::atomic_ref<VAddr>{exclusive_addresses[processor_id]}.exchange(
+            INVALID_EXCLUSIVE_ADDRESS, std::memory_order_acq_rel);
+        if (marked_address != (address & RESERVATION_GRANULE_MASK)) {
+            return false;
+        }
+
+        T saved_value;
+        std::memcpy(&saved_value, exclusive_values[processor_id].data(), sizeof(T));
+        return op(saved_value);
     }
 
     /// Unmark everything.
