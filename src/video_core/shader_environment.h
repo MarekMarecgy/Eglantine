@@ -49,7 +49,7 @@ class GenericEnvironment : public Shader::Environment {
 public:
     explicit GenericEnvironment() = default;
     explicit GenericEnvironment(Tegra::MemoryManager& gpu_memory_, GPUVAddr program_base_,
-                                u32 start_address_, bool support_cooperative_matrix_ = false);
+                                u32 start_address_, bool support_tensor_instructions_ = false);
 
     ~GenericEnvironment() override;
 
@@ -136,7 +136,7 @@ protected:
 
     bool has_unbound_instructions = false;
     bool has_hle_engine_state = false;
-    bool support_cooperative_matrix = false;
+    bool support_tensor_instructions = false;
 };
 
 class GraphicsEnvironment final : public GenericEnvironment {
@@ -147,7 +147,7 @@ public:
                                  Tegra::Engines::Maxwell3D::Regs::ShaderType program,
                                  GPUVAddr program_base_, u32 start_address_,
                                  std::shared_ptr<const LoweredNativeCode> lowered_native_ = {},
-                                 bool support_cooperative_matrix_ = false);
+                                 bool support_tensor_instructions_ = false);
 
     ~GraphicsEnvironment() override = default;
 
@@ -210,7 +210,7 @@ public:
                                 Tegra::MemoryManager& gpu_memory_, GPUVAddr program_base_,
                                 u32 start_address_,
                                 std::shared_ptr<const LoweredNativeCode> lowered_native_ = {},
-                                bool support_cooperative_matrix_ = false);
+                                bool support_tensor_instructions_ = false);
 
     ~ComputeEnvironment() override = default;
 

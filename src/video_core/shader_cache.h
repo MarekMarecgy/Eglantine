@@ -104,10 +104,10 @@ protected:
     bool last_shaders_valid = false;
 
     Tegra::MaxwellDeviceMemoryManager& device_memory;
-    bool support_cooperative_matrix = false;
+    bool support_tensor_instructions = false;
 
-    void SetCooperativeMatrixSupported(bool value) {
-        support_cooperative_matrix = value;
+    void SetTensorInstructionsSupported(bool value) {
+        support_tensor_instructions = value;
     }
 
 private:

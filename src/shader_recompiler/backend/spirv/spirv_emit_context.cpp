@@ -446,11 +446,12 @@ Id DescType(EmitContext& ctx, Id sampled_type, Id pointer_type, u32 count) {
         return pointer_type;
     }
 }
-void ValidateCooperativeMatrix(const Profile& profile, const IR::Program& program) {
+bool ValidateCooperativeMatrix(const Profile& profile, const IR::Program& program) {
     if (!program.info.uses_tensor_mul_add) {
-        return;
+        return false;
     }
-    if (!profile.support_cooperative_matrix || profile.supported_spirv < 0x00010400 ||
+    if ((!profile.support_cooperative_matrix && !profile.support_tensor_shuffle) ||
+        profile.supported_spirv < 0x00010400 ||
         program.stage != Stage::Compute) {
         throw TensorRejected{"host features or shader stage"};
     }
@@ -459,10 +460,13 @@ void ValidateCooperativeMatrix(const Profile& profile, const IR::Program& progra
         size[0] % 32 != 0 || size[1] != 1 || size[2] != 1) {
         throw TensorRejected{"requires full 32-lane subgroups in a one-dimensional workgroup"};
     }
-    const u64 guest_bytes = (u64{program.shared_memory_size} + 15U) & ~u64{15};
-    const u64 scratch_bytes = u64{size[0] / 32U} * 1280U;
-    if (guest_bytes + scratch_bytes > profile.max_compute_shared_memory_size) {
+    if (program.shared_memory_size > profile.max_compute_shared_memory_size) {
         throw TensorRejected{"shared memory limit"};
+    }
+    // The shuffle lowering has no cooperative objects, shared scratch, or barriers.
+    // It can follow structured control flow, including the DKB inference loops.
+    if (!profile.support_cooperative_matrix) {
+        return false;
     }
     size_t remaining{};
     for (const auto* block : program.blocks) {
@@ -475,6 +479,9 @@ void ValidateCooperativeMatrix(const Profile& profile, const IR::Program& progra
             break;
         }
         if (node.type != IR::AbstractSyntaxNode::Type::Block) {
+            if (profile.support_tensor_shuffle) {
+                return false;
+            }
             throw TensorRejected{"control flow before or around a collective"};
         }
         for (const auto& inst : node.data.block->Instructions()) {
@@ -484,6 +491,15 @@ void ValidateCooperativeMatrix(const Profile& profile, const IR::Program& progra
     if (remaining != 0) {
         throw TensorRejected{"collective missing from structured control flow"};
     }
+    const u64 guest_bytes = (u64{program.shared_memory_size} + 15U) & ~u64{15};
+    const u64 scratch_bytes = u64{size[0] / 32U} * 1280U;
+    if (guest_bytes + scratch_bytes > profile.max_compute_shared_memory_size) {
+        if (profile.support_tensor_shuffle) {
+            return false;
+        }
+        throw TensorRejected{"shared memory limit"};
+    }
+    return true;
 }
 } // Anonymous namespace
 
@@ -510,12 +526,14 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     u32& storage_binding{is_unified ? bindings.unified : bindings.storage_buffer};
     u32& texture_binding{is_unified ? bindings.unified : bindings.texture};
     u32& image_binding{is_unified ? bindings.unified : bindings.image};
-    ValidateCooperativeMatrix(profile, program);
+    tensor_uses_cooperative_matrix = ValidateCooperativeMatrix(profile, program);
     AddCapability(spv::Capability::Shader);
-    if (program.info.uses_tensor_mul_add) {
+    if (tensor_uses_cooperative_matrix) {
         AddExtension("SPV_NV_cooperative_matrix");
         AddExtension("SPV_KHR_vulkan_memory_model");
         AddCapability(static_cast<spv::Capability>(5357u));  // CooperativeMatrixNV
+    } else if (program.info.uses_tensor_mul_add) {
+        AddCapability(spv::Capability::GroupNonUniformShuffle);
     }
     DefineCommonTypes(program.info);
     DefineCommonConstants();
@@ -523,7 +541,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineLocalMemory(program);
     DefineSharedMemory(program);
     DefineSharedMemoryFunctions(program);
-    if (program.info.uses_tensor_mul_add) {
+    if (tensor_uses_cooperative_matrix) {
         DefineCooperativeMatrixScratch(program);
     }
     DefineConstantBuffers(program.info, uniform_binding);
@@ -679,7 +697,7 @@ void EmitContext::DefineSharedMemory(const IR::Program& program) {
         profile.support_explicit_workgroup_layout &&
         (!program.info.uses_int8 || profile.support_workgroup_layout_8bit_access) &&
         (!program.info.uses_int16 || profile.support_workgroup_layout_16bit_access) &&
-        (!program.info.uses_tensor_mul_add ||
+        (!tensor_uses_cooperative_matrix ||
          (program.shared_memory_size != 0 && profile.support_workgroup_layout_16bit_access &&
           profile.supported_spirv >= 0x00010400));
     if (program.shared_memory_size == 0) {

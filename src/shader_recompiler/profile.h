@@ -107,6 +107,7 @@ struct Profile {
     u32 max_subgroup_size{};
 
     bool support_cooperative_matrix{};
+    bool support_tensor_shuffle{};
     u32 max_compute_shared_memory_size{};
     u32 max_tensor_workgroup_size{};
 

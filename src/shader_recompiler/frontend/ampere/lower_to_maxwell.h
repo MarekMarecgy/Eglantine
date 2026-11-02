@@ -49,7 +49,7 @@ struct LoweredProgram {
 // Maxwell frontend. These are new instructions, not reinterpretations of the
 // native bytes. Scheduling/control words are added by the environment adapter.
 inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code, bool geometry_stage = false,
-                                     bool support_cooperative_matrix = false) {
+                                     bool support_tensor_instructions = false) {
     LoweredProgram result;
     struct Relocation { u32 output_index; s64 target; };
     std::vector<Relocation> relocations;
@@ -1288,8 +1288,9 @@ case 0x311: { // F2I.FTZ.U64.TRUNC, per nvdisasm: Maxwell's F2I gives 32 bits, s
                 }
                 break;
             }
-            if (mode != "fast" || !support_cooperative_matrix)
-                return fail(index, "native matrix multiply cooperative path unavailable");
+            if ((!mode.empty() && mode != "auto" && mode != "fast" && mode != "scalar") ||
+                !support_tensor_instructions)
+                return fail(index, "native matrix multiply path unavailable");
             if (insn.Bits(12, 4) != 7)
                 return fail(index, "native matrix multiply requires unconditional participation");
             const u32 register_limit = uses_uniform_bank ? 216U : 246U;
@@ -1298,8 +1299,8 @@ case 0x311: { // F2I.FTZ.U64.TRUNC, per nvdisasm: Maxwell's F2I gives 32 bits, s
                 a + 4 > register_limit || b + 2 > register_limit ||
                 (c != 255 && c + 2 > register_limit))
                 return fail(index, "native matrix multiply encoding or register span");
-            // Emit a single TENSOR_MUL_ADD instruction. The IR/SPIR-V backend stages the
-            // fragments through Workgroup memory and lowers it to OpCoopMatrixMulAddNV.
+            // Emit a single TENSOR_MUL_ADD instruction. The SPIR-V backend chooses
+            // register shuffles or the opt-in cooperative-matrix lowering.
             emit((0x5D3ULL << 52) | predicate |
                  (static_cast<u64>(c) << 39) |
                  (static_cast<u64>(b) << 20) |

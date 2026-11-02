@@ -56,6 +56,9 @@ public:
         return static_cast<bool>(pipeline);
     }
 
+    const Shader::Info& GetShaderInfo() const { return info; }
+    u64 GetShaderHash() const { return shader_hash; }
+
 private:
     const Device& device;
     vk::PipelineCache& pipeline_cache;

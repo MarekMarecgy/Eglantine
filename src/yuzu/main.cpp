@@ -31,6 +31,7 @@
 #endif
 
 #include "main_window.h"
+#include "yuzu_cmd/nx2_sampler.h"
 
 #ifdef _WIN32
 #include <QScreen>
@@ -143,6 +144,7 @@ static void LoadNx2Switches(const char* argv0) {
 
 int main(int argc, char* argv[]) {
     LoadNx2Switches(argv[0]);
+    Nx2Sampler::StartFromEnvironment();
 
 #if YUZU_ROOM
     bool launch_room = false;

@@ -15,6 +15,7 @@ endif()
 find_package(Qt6 REQUIRED COMPONENTS Widgets)
 
 add_executable(yuzu
+    ../yuzu_cmd/nx2_sampler.cpp
     Info.plist
     about_dialog.cpp
     about_dialog.h

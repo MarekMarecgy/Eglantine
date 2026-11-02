@@ -324,6 +324,7 @@ public:
     Id cooperative_matrix_type_c{};
     Id coop_scratch{};
     Id coop_scratch_f16{};
+    bool tensor_uses_cooperative_matrix{};
     u32 rescaling_textures_member_index{};
     u32 rescaling_images_member_index{};
     u32 rescaling_downfactor_member_index{};

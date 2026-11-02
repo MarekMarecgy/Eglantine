@@ -27,7 +27,7 @@ struct TensorProgram {
     IR::Program program;
     Profile profile;
 
-    explicit TensorProgram(u32 count = 1) {
+    explicit TensorProgram(u32 count = 1, bool storage_io = false) {
         program.stage = Stage::Compute;
         program.workgroup_size = {64, 1, 1};
         program.blocks = {&block};
@@ -47,9 +47,18 @@ struct TensorProgram {
             return;
         }
         const auto lane = ir.LaneId();
+        IR::U32 byte_offset;
+        if (storage_io) {
+            program.info.uses_local_invocation_id = true;
+            program.info.storage_buffers_descriptors.push_back({0, 0, 1, true});
+            byte_offset = ir.IMul(ir.LocalInvocationIdX(), ir.Imm32(40U));
+        }
         std::array<IR::U32, 8> inputs;
         for (u32 i = 0; i < inputs.size(); ++i) {
-            inputs[i] = ir.IAdd(ir.Imm32((i + 1) * 0x01000100U), lane);
+            inputs[i] = storage_io
+                            ? IR::U32{ir.Inst(IR::Opcode::LoadStorage32, ir.Imm32(0U),
+                                             ir.IAdd(byte_offset, ir.Imm32(i * 4U)))}
+                            : IR::U32{ir.IAdd(ir.Imm32((i + 1) * 0x01000100U), lane)};
         }
         for (u32 i = 0; i < count; ++i) {
             const auto result = ir.Inst(IR::Opcode::TensorMulAdd, inputs[0], inputs[1],
@@ -57,6 +66,12 @@ struct TensorProgram {
                                        inputs[6], inputs[7]);
             inputs[6] = IR::U32{ir.CompositeExtract(result, 0)};
             inputs[7] = IR::U32{ir.CompositeExtract(result, 1)};
+        }
+        if (storage_io) {
+            for (u32 i = 0; i < 2; ++i) {
+                ir.Inst(IR::Opcode::WriteStorage32, ir.Imm32(0U),
+                        ir.IAdd(byte_offset, ir.Imm32((i + 8) * 4U)), inputs[i + 6]);
+            }
         }
     }
 
@@ -250,11 +265,85 @@ TEST_CASE("NV tensor shape requires the exact scope and all four half types", "[
     REQUIRE_FALSE(Vulkan::IsTensorMatrixShape(wrong));
 }
 
-TEST_CASE("Native tensor lowering remains opt-in and preserves fallback errors", "[video_core][tensor]") {
+TEST_CASE("Shuffle tensor lowering needs neither half math nor shared scratch", "[video_core][tensor]") {
+    TensorProgram fixture;
+    fixture.profile.support_cooperative_matrix = false;
+    fixture.profile.support_tensor_shuffle = true;
+    fixture.program.shared_memory_size = fixture.profile.max_compute_shared_memory_size;
+    const auto code = fixture.Emit("tensor-shuffle");
+    REQUIRE_FALSE(HasCapability(code, 5357));
+    REQUIRE_FALSE(HasCapability(code, 9)); // Float16
+    REQUIRE(HasCapability(code, 65)); // GroupNonUniformShuffle
+    REQUIRE(Instructions(code, 224).empty()); // OpControlBarrier
+    REQUIRE(Instructions(code, 345).size() == 32); // OpGroupNonUniformShuffle
+}
+
+TEST_CASE("Shuffle tensor lowering accepts a structured selection before the multiply",
+          "[video_core][tensor]") {
+    TensorProgram fixture;
+    IR::Block entry{fixture.pool}, body{fixture.pool};
+    IR::IREmitter ir{entry};
+    const auto group = ir.WorkgroupIdX();
+    const auto cond = ir.IEqual(group, ir.Imm32(0U));
+    fixture.program.info.uses_workgroup_id = true;
+    fixture.program.blocks = {&entry, &body, &fixture.block};
+    fixture.program.post_order_blocks = {&fixture.block, &body, &entry};
+    fixture.program.syntax_list = {
+        {{.block = &entry}, IR::AbstractSyntaxNode::Type::Block},
+        {{.if_node = {cond, &body, &fixture.block}}, IR::AbstractSyntaxNode::Type::If},
+        {{.block = &body}, IR::AbstractSyntaxNode::Type::Block},
+        {{.end_if = {&fixture.block}}, IR::AbstractSyntaxNode::Type::EndIf},
+        {{.block = &fixture.block}, IR::AbstractSyntaxNode::Type::Block},
+        {{}, IR::AbstractSyntaxNode::Type::Return},
+    };
+    REQUIRE_THROWS_AS(fixture.Emit(), TensorRejected);
+    fixture.profile.support_tensor_shuffle = true;
+    const auto code = fixture.Emit("tensor-shuffle-selection");
+    REQUIRE_FALSE(HasCapability(code, 5357));
+    REQUIRE(Instructions(code, 224).empty());
+    REQUIRE(Instructions(code, 345).size() == 32);
+}
+
+// With EDEN_TENSOR_TEST_OUTPUT these modules can also be dispatched by a Vulkan
+// harness to compare all four outputs per lane against a CPU matrix reference.
+TEST_CASE("Shuffle tensor arithmetic modules retain observable storage outputs", "[video_core][tensor]") {
+    for (u32 count : {1U, 2U}) {
+        TensorProgram fixture{count, true};
+        fixture.profile.support_cooperative_matrix = false;
+        fixture.profile.support_tensor_shuffle = true;
+        const auto code = fixture.Emit("tensor-shuffle-io-" + std::to_string(count));
+        REQUIRE(Instructions(code, 345).size() == 32 * count);
+        REQUIRE_FALSE(HasCapability(code, 9));
+    }
+    TensorProgram fixture{1, true};
+    fixture.profile.support_tensor_shuffle = true;
+    IR::Block entry{fixture.pool}, merge{fixture.pool};
+    IR::IREmitter ir{entry};
+    const auto cond = ir.ILessThan(ir.LocalInvocationIdX(), ir.Imm32(32U), false);
+    fixture.program.blocks = {&entry, &fixture.block, &merge};
+    fixture.program.post_order_blocks = {&merge, &fixture.block, &entry};
+    fixture.program.syntax_list = {
+        {{.block = &entry}, IR::AbstractSyntaxNode::Type::Block},
+        {{.if_node = {cond, &fixture.block, &merge}}, IR::AbstractSyntaxNode::Type::If},
+        {{.block = &fixture.block}, IR::AbstractSyntaxNode::Type::Block},
+        {{.end_if = {&merge}}, IR::AbstractSyntaxNode::Type::EndIf},
+        {{.block = &merge}, IR::AbstractSyntaxNode::Type::Block},
+        {{}, IR::AbstractSyntaxNode::Type::Return},
+    };
+    const auto code = fixture.Emit("tensor-shuffle-io-guarded");
+    REQUIRE_FALSE(HasCapability(code, 5357));
+    REQUIRE(Instructions(code, 224).empty());
+}
+
+TEST_CASE("Native tensor lowering preserves explicit disable and fallback errors", "[video_core][tensor]") {
     TensorMode mode{nullptr};
     std::array<Ampere::Instruction, 2> code{{
         {{0x0810723c, 12, 0x8ff, 0}}, {{0x0000794d, 0, 0x03800000, 0}}}};
+    REQUIRE(static_cast<bool>(Ampere::LowerToMaxwell(code, false, true)));
+    TensorMode::Set("off");
     REQUIRE_FALSE(static_cast<bool>(Ampere::LowerToMaxwell(code, false, true)));
+    TensorMode::Set("scalar");
+    REQUIRE(static_cast<bool>(Ampere::LowerToMaxwell(code, false, true)));
     TensorMode::Set("fast");
     const auto unsupported = Ampere::LowerToMaxwell(code, false, false);
     REQUIRE_FALSE(static_cast<bool>(unsupported));

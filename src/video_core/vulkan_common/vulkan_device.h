@@ -721,6 +721,19 @@ FN_MAX_LIMIT_LIST
     }
 
     /// Returns true if the device supports VK_NV_cooperative_matrix (used for tensor ops).
+    bool IsTensorShuffleSupported() const {
+        return SupportedSpirvVersion() >= 0x00010400 && extensions.subgroup_size_control &&
+               features.subgroup_size_control.subgroupSizeControl &&
+               features.subgroup_size_control.computeFullSubgroups &&
+               IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT) &&
+               properties.subgroup_size_control.minSubgroupSize <= 32 &&
+               properties.subgroup_size_control.maxSubgroupSize >= 32 &&
+               (GetSubgroupSupportedStages() & VK_SHADER_STAGE_COMPUTE_BIT) &&
+               IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_BASIC_BIT) &&
+               IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_SHUFFLE_BIT);
+    }
+
+    /// Returns true if the device supports VK_NV_cooperative_matrix (used for tensor ops).
     bool IsExtCooperativeMatrixSupported() const {
         return extensions.cooperative_matrix &&
                features.cooperative_matrix_features.cooperativeMatrix &&

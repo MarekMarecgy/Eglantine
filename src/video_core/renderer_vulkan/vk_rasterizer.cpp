@@ -61,6 +61,10 @@ using VideoCommon::ImageViewType;
 
 
 namespace {
+u32 draw_probe_mode{};
+bool capture_post_frame{};
+u32 capture_post_serial{}, capture_post_draw{};
+std::set<std::pair<GPUVAddr, u64>> captured_post_passes;
 constexpr u32 TERRAIN_CULLING_INDEX_COUNTER_CBUF_OFFSET = 0x410;
 constexpr u32 TERRAIN_CULLING_INDEX_LIST_CBUF_OFFSET = 0x420;
 constexpr size_t TERRAIN_CULLING_MAX_APPENDED_INDICES = size_t{1} << 22;
@@ -392,6 +396,22 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, u32 direct_draw_instance_cou
         UpdateDynamicStates();
     }
 
+    if (std::getenv("EDEN_NX2_DRAW_PROBE") && !(draw_probe_mode & 128) &&
+        device.IsExtExtendedDynamicStateSupported()) {
+        const auto& regs = maxwell3d->regs;
+        scheduler.Record([mode = draw_probe_mode, depth = regs.depth_test_enable,
+                          write = regs.depth_write_enabled, bounds = regs.depth_bounds_enable,
+                          stencil = regs.stencil_enable, cull = regs.gl_cull_test_enabled,
+                          face = regs.gl_cull_face](vk::CommandBuffer cmdbuf) {
+            const u32 mask = mode >> 8 ? mode >> 8 : 31U;
+            if (mask & 1) cmdbuf.SetDepthTestEnableEXT((mode & 1) ? false : bool(depth));
+            if (mask & 2) cmdbuf.SetDepthWriteEnableEXT((mode & 1) ? false : bool(write));
+            if (mask & 4) cmdbuf.SetDepthBoundsTestEnableEXT((mode & 1) ? false : bool(bounds));
+            if (mask & 8) cmdbuf.SetStencilTestEnableEXT((mode & 1) ? false : bool(stencil));
+            if (mask & 16) cmdbuf.SetCullModeEXT((mode & 2) || !cull ? VK_CULL_MODE_NONE : MaxwellToVK::CullFace(face));
+        });
+    }
+
     query_cache.NotifySegment(true);
     HandleTransformFeedback();
     query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
@@ -400,6 +420,64 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, u32 direct_draw_instance_cou
         draw_func();
     }
     submitted = true;
+    if (capture_post_frame && capture_post_draw < 128 &&
+        static_cast<u32>(maxwell3d->regs.rt[0].format) != 0 &&
+        pipeline->GetFragmentInfo().stores_frag_color[0] && maxwell3d->regs.rt[0].width >= 1000 &&
+        maxwell3d->regs.rt[0].height >= 500 &&
+        (is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
+                    : maxwell3d->draw_manager.draw_state.vertex_buffer.count) <= 6 &&
+        captured_post_passes.emplace(maxwell3d->regs.rt[0].Address(),
+            (u64{maxwell3d->regs.pipelines[5].reserved[0] & 0xff} << 32) |
+                maxwell3d->regs.pipelines[5].reserved[1]).second) {
+        const auto& regs = maxwell3d->regs;
+        const auto root = std::string{std::getenv("EDEN_NX2_DRAW_PROBE")} + "-captures";
+        std::filesystem::create_directories(root);
+        const auto prefix = fmt::format("{}/{}-{}-{}", root, capture_post_serial,
+                                       Settings::IsDockedMode(), capture_post_draw++);
+        std::ofstream meta(prefix + ".txt");
+        scheduler.Finish();
+        const auto dump = [&](std::string suffix, GPUVAddr address, size_t size) {
+            size = (std::min)(size, size_t{32 * 1024 * 1024});
+            if (!size || !gpu_memory->IsFullyMappedRange(address, size)) return;
+            if (const auto physical = gpu_memory->GpuToCpuAddress(address)) {
+                texture_cache.DownloadMemory(*physical, size);
+                buffer_cache.DownloadMemory(*physical, size);
+            }
+            std::vector<u8> bytes(size);
+            gpu_memory->ReadBlockUnsafe(address, bytes.data(), size);
+            std::ofstream file(prefix + suffix + ".bin", std::ios::binary);
+            file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+            meta << fmt::format("{} address={:#x} size={} nonzero={}\n", suffix, address, size,
+                std::count_if(bytes.begin(), bytes.end(), [](u8 v){ return v != 0; }));
+        };
+        const auto& rt = regs.rt[0];
+        meta << fmt::format("rt {}x{} format={:#x} block={}/{} vs={:#x} ps={:#x}\n",
+            rt.width, rt.height, static_cast<u32>(rt.format), rt.tile_mode.block_height.Value(),
+            rt.tile_mode.block_depth.Value(),
+            (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1],
+            (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1]);
+        dump("-rt", rt.Address(), size_t{rt.array_pitch} * 4);
+        for (u32 bank = 0; bank < 8; ++bank) {
+            const auto& cb = maxwell3d->state.shader_stages[4].const_buffers[bank];
+            if (cb.enabled) dump(fmt::format("-cb{}", bank), cb.address, cb.size);
+        }
+        u32 index{};
+        for (const auto& desc : pipeline->GetFragmentInfo().texture_descriptors) {
+            const auto& cb = maxwell3d->state.shader_stages[4].const_buffers[desc.cbuf_index];
+            if (!cb.enabled) continue;
+            const u32 handle = gpu_memory->Read<u32>(cb.address + desc.cbuf_offset);
+            Tegra::Texture::TICEntry tic{};
+            gpu_memory->ReadBlockUnsafe(regs.tex_header.Address() + u64{handle & 0xfffff} * sizeof(tic), &tic, sizeof(tic));
+            const auto suffix = fmt::format("-tex{}", index++);
+            meta << fmt::format("{} c{}[{:#x}] {}x{} format={} block={}\n", suffix,
+                desc.cbuf_index, desc.cbuf_offset, tic.Width(), tic.Height(),
+                static_cast<u32>(tic.format.Value()), tic.block_height.Value());
+            std::ofstream file(prefix + suffix + ".tic", std::ios::binary);
+            file.write(reinterpret_cast<const char*>(&tic), sizeof(tic));
+            if (tic.Width() >= 1000 && tic.Height() >= 500)
+                dump(suffix, tic.Address(), gpu_memory->GetMemoryLayoutSize(tic.Address()));
+        }
+    }
     static u32 native_capture_count{};
     if (maxwell3d->GetNativeMacroEngine().native_turing &&
         native_capture_count < 16 && [] {
@@ -1086,6 +1164,73 @@ void RasterizerVulkan::DispatchCompute() {
         return;
     }
     std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
+    const auto& diagnostic_info = pipeline->GetShaderInfo();
+    const char* tensor_dump = diagnostic_info.uses_tensor_mul_add
+                                  ? std::getenv("EDEN_NX2_TENSOR_DUMP") : nullptr;
+    static std::unordered_map<u64, u32> tensor_dispatches;
+    const u32 tensor_dispatch = tensor_dump ? tensor_dispatches[pipeline->GetShaderHash()]++ : 0;
+    const bool capture_tensor = tensor_dump && (tensor_dispatch == 0 || tensor_dispatch == 20);
+    const auto dump_tensor = [&](std::string_view phase) {
+        if (!capture_tensor) return;
+        scheduler.Finish();
+        std::filesystem::create_directories(tensor_dump);
+        const auto prefix = fmt::format("{}/{:016x}-{}-{}", tensor_dump,
+                                        pipeline->GetShaderHash(), tensor_dispatch, phase);
+        const auto dump = [&](std::string_view suffix, GPUVAddr address, size_t size) {
+            if (!size || !gpu_memory->IsFullyMappedRange(address, size)) return;
+            if (const auto physical = gpu_memory->GpuToCpuAddress(address)) {
+                texture_cache.DownloadMemory(*physical, size);
+                buffer_cache.DownloadMemory(*physical, size);
+            }
+            std::vector<u8> bytes(size);
+            gpu_memory->ReadBlockUnsafe(address, bytes.data(), size);
+            std::ofstream file(prefix + std::string{suffix} + ".bin", std::ios::binary);
+            file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+            LOG_INFO(Render_Vulkan, "Tensor capture {}{} address {:#x} size {} nonzero {}",
+                     prefix, suffix, address, size,
+                     std::count_if(bytes.begin(), bytes.end(), [](u8 v) { return v != 0; }));
+        };
+        const auto& cbufs = kepler_compute->launch_description.const_buffer_config;
+        for (u32 index = 0; index < cbufs.size(); ++index) {
+            if ((kepler_compute->launch_description.const_buffer_enable_mask >> index) & 1) {
+                dump(fmt::format("-cbuf{}", index), cbufs[index].Address(),
+                     (std::min)(size_t{cbufs[index].size}, size_t{4096}));
+            }
+        }
+        u32 index{};
+        for (const auto& desc : diagnostic_info.storage_buffers_descriptors) {
+            const auto descriptor = cbufs[desc.cbuf_index].Address() + desc.cbuf_offset;
+            const auto address = gpu_memory->Read<u64>(descriptor);
+            const auto size_word = gpu_memory->Read<u64>(descriptor + 8);
+            const auto mapped = gpu_memory->GetMemoryLayoutSize(address);
+            const auto size = size_word && size_word <= mapped ? size_word : mapped;
+            LOG_INFO(Render_Vulkan, "Tensor SSBO {} c{}[{:#x}] address {:#x} next {:#x} mapped {} written {}",
+                     index, desc.cbuf_index, desc.cbuf_offset, address, size_word, mapped, desc.is_written);
+            dump(fmt::format("-ssbo{}", index++), address, (std::min)(size_t{size}, size_t{4 * 1024 * 1024}));
+        }
+        const auto dump_image = [&](const auto& desc, std::string_view kind, u32 number) {
+            const auto handle = gpu_memory->Read<u32>(cbufs[desc.cbuf_index].Address() + desc.cbuf_offset);
+            const auto tic_index = Tegra::Texture::TexturePair(
+                handle, kepler_compute->launch_description.linked_tsc != 0).first;
+            Tegra::Texture::TICEntry tic;
+            gpu_memory->ReadBlockUnsafe(kepler_compute->regs.tic.Address() + tic_index * sizeof(tic),
+                                       &tic, sizeof(tic));
+            LOG_INFO(Render_Vulkan, "Tensor {} {} c{}[{:#x}] handle {:#x} address {:#x} {}x{} format {} pitchlinear {} block {}/{}/{}",
+                     kind, number, desc.cbuf_index, desc.cbuf_offset, handle, tic.Address(),
+                     tic.Width(), tic.Height(), static_cast<u32>(tic.format.Value()), tic.IsPitchLinear(),
+                     tic.block_width.Value(), tic.block_height.Value(), tic.block_depth.Value());
+            const auto suffix = fmt::format("-{}{}", kind, number);
+            std::ofstream descriptor_file(prefix + suffix + ".tic", std::ios::binary);
+            descriptor_file.write(reinterpret_cast<const char*>(&tic), sizeof(tic));
+            dump(suffix, tic.Address(), (std::min)(
+                size_t{gpu_memory->GetMemoryLayoutSize(tic.Address())}, size_t{32 * 1024 * 1024}));
+        };
+        index = 0;
+        for (const auto& desc : diagnostic_info.texture_descriptors) dump_image(desc, "texture", index++);
+        index = 0;
+        for (const auto& desc : diagnostic_info.image_descriptors) dump_image(desc, "image", index++);
+    };
+    dump_tensor("before");
     if (!pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
                              texture_cache)) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
@@ -1130,6 +1275,7 @@ void RasterizerVulkan::DispatchCompute() {
         }
         cmdbuf.Dispatch(dim[0], dim[1], dim[2]);
     });
+    dump_tensor("after");
 
     // Log compute dispatch
     if (GPU::Logging::IsActive() &&
@@ -1450,6 +1596,20 @@ void RasterizerVulkan::FlushCommands() {
 }
 
 void RasterizerVulkan::TickFrame() {
+    if (const char* path = std::getenv("EDEN_NX2_DRAW_PROBE")) {
+        u32 mode{};
+        std::ifstream(path) >> mode;
+        capture_post_frame = (mode & 65536) && !(draw_probe_mode & 65536);
+        if (capture_post_frame) { ++capture_post_serial; capture_post_draw = 0; captured_post_passes.clear(); }
+        static int last_docked = -1;
+        const int docked = Settings::IsDockedMode();
+        if (mode != draw_probe_mode || last_docked != docked) {
+            LOG_INFO(Render_Vulkan, "Draw diagnostic probe mode {} docked {}", mode, docked);
+            std::ofstream(std::string{path} + ".status") << "mode=" << mode << " docked=" << docked;
+            draw_probe_mode = mode;
+            last_docked = docked;
+        }
+    }
     draw_counter = 0;
     guest_descriptor_queue.TickFrame();
     compute_pass_descriptor_queue.TickFrame();

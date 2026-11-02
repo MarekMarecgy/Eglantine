@@ -68,7 +68,7 @@ using VideoCommon::FileEnvironment;
 using VideoCommon::GenericEnvironment;
 using VideoCommon::GraphicsEnvironment;
 
-constexpr u32 CACHE_VERSION = 25;
+constexpr u32 CACHE_VERSION = 26;
 constexpr size_t VULKAN_CACHE_FLUSH_PIPELINES = 128;
 constexpr size_t VULKAN_CACHE_FLUSH_MIN_SECONDS = 30;
 constexpr std::array<char, 8> VULKAN_CACHE_MAGIC_NUMBER{'y', 'u', 'z', 'u', 'v', 'k', 'c', 'h'};
@@ -440,7 +440,15 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     const char* tensor_mode = std::getenv("EDEN_NX2_TENSOR");
     const bool tensor_enabled = tensor_mode && std::string_view{tensor_mode} == "fast" &&
                                 device.IsExtCooperativeMatrixSupported();
-    SetCooperativeMatrixSupported(tensor_enabled);
+    const bool tensor_shuffle_enabled =
+        (!tensor_mode || std::string_view{tensor_mode} == "auto" ||
+         std::string_view{tensor_mode} == "scalar" || std::string_view{tensor_mode} == "fast") &&
+        device.IsTensorShuffleSupported() &&
+        device.GetMaxTensorWorkgroupSize() >= 32;
+    SetTensorInstructionsSupported(tensor_enabled || tensor_shuffle_enabled);
+    LOG_INFO(Render_Vulkan, "Native tensor lowering: register shuffles {}, cooperative matrix {}",
+             tensor_shuffle_enabled ? "enabled" : "unavailable or disabled",
+             tensor_enabled ? "enabled" : "unavailable or disabled");
     if (use_async_translation) {
         LOG_INFO(Render_Vulkan, "Native graphics pipelines are translated on {} worker threads",
                  num_translation_threads);
@@ -554,6 +562,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .has_broken_spirv_subgroup_shuffle = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
         .max_subgroup_size = device.GetMaxSubgroupSize(),
         .support_cooperative_matrix = tensor_enabled,
+        .support_tensor_shuffle = tensor_shuffle_enabled,
         .max_compute_shared_memory_size = device.GetMaxComputeSharedMemorySize(),
         .max_tensor_workgroup_size = device.GetMaxTensorWorkgroupSize(),
         .has_broken_robust =
@@ -1485,7 +1494,7 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
     const auto& qmd{kepler_compute->launch_description};
     ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start,
-                           shader->lowered_native, profile.support_cooperative_matrix};
+                           shader->lowered_native, support_tensor_instructions};
     env.SetCachedSize(shader->size_bytes);
 
     main_pools.ReleaseContents();
@@ -1534,6 +1543,17 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
         program.shared_memory_size = max_shared_memory;
     }
     const std::vector<u32> code{EmitSPIRV(profile, program)};
+
+    if (program.info.uses_tensor_mul_add) {
+        if (const char* directory = std::getenv("EDEN_NX2_TENSOR_DUMP")) {
+            std::filesystem::create_directories(directory);
+            const auto prefix = fmt::format("{}/{:016x}", directory, key.unique_hash);
+            std::ofstream ir_file(prefix + ".ir.txt");
+            ir_file << Shader::IR::DumpProgram(program);
+            std::ofstream spv_file(prefix + ".spv", std::ios::binary);
+            spv_file.write(reinterpret_cast<const char*>(code.data()), code.size() * sizeof(u32));
+        }
+    }
 
     // Text log + .spv dump. Done before pipeline build so a driver crash still leaves the module.
     {

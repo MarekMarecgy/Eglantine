@@ -20,10 +20,59 @@ constexpr u32 B_BASE = 256;  // 16x8 f16
 constexpr u32 C_BASE = 384;  // 16x8 f16
 constexpr u32 D_BASE = 512;  // 16x8 f16
 
+// Compute the same four output elements per lane using full-warp register shuffles.
+// Pack/unpack perform the half conversions without enabling native Float16 math.
+// Accumulate in f32 and round to f16 at the HMMA instruction boundary. The guest
+// instruction requires all 32 lanes to participate; no extra workgroup barrier
+// or dynamically uniform cooperative-matrix object is introduced here.
+Id EmitTensorShuffle(EmitContext& ctx, Id a0, Id a1, Id a2, Id a3, Id b0, Id b1,
+                     Id c0, Id c1) {
+    const Id u32ty{ctx.U32[1]};
+    const Id f32{ctx.F32[1]};
+    const Id lane{ctx.OpLoad(u32ty, ctx.subgroup_local_invocation_id)};
+    const Id group{ctx.OpBitwiseAnd(u32ty, lane, ctx.Const(28U))}; // 4 * row group
+    const Id column{ctx.OpShiftLeftLogical(
+        u32ty, ctx.OpBitwiseAnd(u32ty, lane, ctx.Const(3U)), ctx.Const(3U))}; // 4 * (2i)
+    const auto unpack = [&](Id packed) { return ctx.OpUnpackHalf2x16(ctx.F32[2], packed); };
+    const auto shuffle = [&](Id packed, Id source) {
+        return unpack(ctx.OpGroupNonUniformShuffle(u32ty, ctx.Const(3U), packed, source));
+    };
+    const auto half = [&](Id pair, u32 index) { return ctx.OpCompositeExtract(f32, pair, index); };
+    const Id c_top{unpack(c0)};
+    const Id c_bottom{unpack(c1)};
+    std::array<Id, 4> result{half(c_top, 0), half(c_top, 1),
+                             half(c_bottom, 0), half(c_bottom, 1)};
+    for (u32 pair = 0; pair < 8; ++pair) {
+        const Id a_lane{ctx.OpIAdd(u32ty, group, ctx.Const(pair % 4))};
+        const Id b_lane{ctx.OpIAdd(u32ty, column, ctx.Const(pair % 4))};
+        const Id a_top{shuffle(pair < 4 ? a0 : a2, a_lane)};
+        const Id a_bottom{shuffle(pair < 4 ? a1 : a3, a_lane)};
+        const Id b_left{shuffle(pair < 4 ? b0 : b1, b_lane)};
+        const Id b_right{shuffle(pair < 4 ? b0 : b1,
+                                 ctx.OpIAdd(u32ty, b_lane, ctx.Const(4U)))};
+        for (u32 k = 0; k < 2; ++k) {
+            const Id at{half(a_top, k)}, ab{half(a_bottom, k)};
+            const Id bl{half(b_left, k)}, br{half(b_right, k)};
+            result[0] = ctx.OpFma(f32, at, bl, result[0]);
+            result[1] = ctx.OpFma(f32, at, br, result[1]);
+            result[2] = ctx.OpFma(f32, ab, bl, result[2]);
+            result[3] = ctx.OpFma(f32, ab, br, result[3]);
+        }
+    }
+    const Id d0{ctx.OpPackHalf2x16(
+        u32ty, ctx.OpCompositeConstruct(ctx.F32[2], result[0], result[1]))};
+    const Id d1{ctx.OpPackHalf2x16(
+        u32ty, ctx.OpCompositeConstruct(ctx.F32[2], result[2], result[3]))};
+    return ctx.OpCompositeConstruct(ctx.U32[2], d0, d1);
+}
+
 } // Anonymous namespace
 
 Id EmitTensorMulAdd(EmitContext& ctx, IR::Inst* inst, Id a0, Id a1, Id a2, Id a3, Id b0, Id b1,
                     Id c0, Id c1) {
+    if (!ctx.tensor_uses_cooperative_matrix) {
+        return EmitTensorShuffle(ctx, a0, a1, a2, a3, b0, b1, c0, c1);
+    }
     const Id u32ty{ctx.U32[1]};
     const Id f16{ctx.F16[1]};
     const Id f16x2{ctx.F16[2]};

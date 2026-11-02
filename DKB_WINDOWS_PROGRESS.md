@@ -1,5 +1,12 @@
 # Donkey Kong Bananza — gałąź `windows-dkb-fixes`, stan i postępy
 
+> Aktualizacja Codex, koniec sesji 2026-11-02: dodano obsługę HMMA przez shuffles,
+> ale **docked nadal daje czarny obraz z HUD-em**. Handheld przywraca scenę, nadal
+> występują duże spadki FPS. Pełny stan kodu, odzyskanego profilu Claude'a, testów,
+> zrzutów i punkt wznowienia: [docs/dkb-render-investigation.md](docs/dkb-render-investigation.md).
+> Poniższe wcześniejsze wpisy opisują wcześniejsze etapy; nie oznaczają ukończenia
+> obecnej naprawy. Sesję zakończono na prośbę użytkownika.
+
 Gra: Donkey Kong Bananza (`040074A01BF12000`), update v0.6.0.
 Gałąź bazuje na `nx2` i zawiera tylko te poprawki z `macos-moltenvk-dkb-fixes`,
 które nie zależą od platformy. Szczegółowy dziennik śledztwa (macOS) jest na gałęzi macOS.
