@@ -103,14 +103,76 @@ z bananem. Zawsze sprawdzać `SetTerminateResult` w logu, zanim uzna się test z
   samouczka. Nie badane.
 - **Kwadratowe artefakty w filmikach samouczków** (pomarańczowe kwadraty na żółtym tle) —
   nie badane; możliwy problem dekodera VP9 albo kopiowania obrazu.
-- **Upscaler tensorowy** (compute 2880×1620, HMMA) jest odrzucany: na kartach Ampere+ sterownik ma
-  wyłączone float16, więc `EDEN_NX2_TENSOR=fast` się nie włącza, a zastępczy blit
-  (`UpscaleInsteadOfNativeProgram`) szuka uchwytów pod cbuf0+0x90/0xa0, których DKB nie używa.
-  Obraz i tak się wyświetla.
+- **Upscaler tensorowy** — przyczyna powrotu fioletu, patrz „Fioletowy ekran poza tunelem”.
 - **Czarna sylwetka DK** w przerywniku „Oh, Banana!” — nie badane; w logu brak pominiętych
   pipeline'ów i odrzuconych shaderów.
-- **Wydajność:** 23–36 kl/s na Ryzen 7 9800X3D + RTX 5070 Ti, GPU ~25% — ograniczenie po stronie
-  CPU/wątku GPU emulatora, nie karty.
+- **Wydajność** — patrz „Wydajność (sesja 2026-11-02, wieczór)”.
+
+### Fioletowy ekran poza tunelem — przyczyna znana, bez poprawki (2026-11-02, wieczór)
+
+- **Objaw:** w obszarze z celem „Meet up with others” (inny niż tunel z punktu 3) cały ekran znów
+  jest fioletowy, widać tylko HUD. Powtarzalne w 4 uruchomieniach z rzędu.
+- **To nie jest teren:** emulacja GS terenu działa (`Terrain culling geometry shader emulated`
+  w logu). Tymczasowy log każdego pipeline'u z natywnym geometry shaderem (w
+  `CurrentGraphicsPipelineSlowPath` i przy wczytywaniu z dysku) nie znalazł żadnego innego GS.
+- **Przyczyna:** zaraz po wczytaniu poziomu gra uruchamia sieć neuronową na rdzeniach tensorowych
+  (compute z HMMA.16816.F16). Emulator ją odrzuca:
+  `Native compute shader rejected: ... native matrix multiply cooperative path unavailable`
+  (shadery z HMMA pod instrukcją 0x2800 i 0x1d60; adresy zmieniają się między sesjami;
+  grid 40×23 lub 60×34, block 128×1×1). Zastępczy blit `UpscaleInsteadOfNativeProgram` nic nie
+  robi: w cbuf0 jest tylko uchwyt @0x110 = tic 95 z adresem 0 (DKB nie używa 0x90/0xa0 jak
+  tytuł 4). Wyjście sieci zostaje niezapisane → kolor tła. W udanym przebiegu w tunelu
+  (punkt 3) ta sieć w ogóle się nie uruchomiła.
+- **Dowód:** `EDEN_NX2_TENSOR=stub` (D=C zamiast mnożenia) → fiolet znika, scena się rysuje, ale
+  ciemna i zniekształcona (sieć nie jest liczona naprawdę).
+- **Próba `EDEN_NX2_TENSOR=fast` (cofnięta):** blokuje go `vulkan_device.cpp` (~602), który na
+  NVIDIA Ampere+ zeruje `shaderFloat16`. Zmiana testowa: zostawić `shaderFloat16` włączone na
+  urządzeniu, dodać flagę `float16_math_broken` sprawdzaną w `IsFloat16Supported()`, a w
+  `IsExtCooperativeMatrixSupported()` sprawdzać surowe `shaderFloat16`. Wynik: ścieżka „on, device
+  eligible” na RTX 5070 Ti, ale backend SPIR-V odrzuca shader DKB:
+  `native matrix multiply rejected: control flow before or around a collective`.
+- **Co dalej:** obsłużyć kolektywy HMMA wewnątrz lub po kontroli przepływu w shaderze DKB
+  (`docs/experimental-cooperative-matrix.md`; np. lowering przez pamięć współdzieloną zamiast
+  cooperative matrix, bez wymogu jednolitego przepływu), razem z poprawką float16 wyżej.
+  Sprawdzić wynik zrzutem ekranu.
+
+### Wydajność (sesja 2026-11-02, wieczór)
+
+Sprzęt: Ryzen 7 9800X3D (8C/16T), RTX 5070 Ti, 31 GB RAM, Windows 11.
+
+- W obszarze „Meet up with others”: **~9–10 kl/s (90–115 ms na klatkę)** przy każdej kombinacji
+  ustawień z tej sesji (także bez profilera i z podziałem wątku GPU). W tunelu wcześniej 23–36 kl/s.
+- Jeden wątek emulatora na 100%, GPU 40–54% (`nvidia-smi`). ~91 000 draw/s przy ~9 kl/s, czyli
+  **~10 000 draw na klatkę**. 60 kl/s wymagałoby ~600 000 draw/s (Mario Kart World po podziale
+  wątku GPU: 50–66 tys./s), więc same ustawienia tego nie załatwią.
+- **`gpu_accuracy = High` (domyślne) wyłącza podział wątku GPU** (`gpu_split.cpp`, `MaybeStart`:
+  `allowed` wymaga `!IsGPULevelHigh()`); w samplerze nie było wątku `GPUBack`. Z `gpu_accuracy=0`
+  (Low) w ini gry log pokazuje „GPU thread split: engine methods run on a second thread”, ale FPS
+  w tym miejscu się nie zmienił (~10). Ustawienie cofnięte.
+- Sampler (High, z `EDEN_NX2_GPU_PROFILE`): rdzenie gościa ~92% bezczynne, `VulkanWorker` ~84%
+  bezczynny; wątek `GPU`: ~27% czeka na komendy (SPSC Pop), ~15% `ReleaseFences` pod
+  `ProcessSemaphoreTriggerMethod` (High czeka na fence), `AppendUnculledTrianglesForTerrainCullingShader`
+  ~4%. Samplerem nie zmierzono jeszcze przebiegu na Low bez profilera.
+- **Uwaga do pomiarów:** `EDEN_NX2_GPU_PROFILE` sam zabiera ~25% wątku GPU (`WallClock::GetTimeNS`),
+  więc z nim FPS jest zaniżone. Symbolizacja samplera myli nazwy funkcji (linker scala identyczne
+  funkcje, np. lambda `IndexToXmm`, `UnpackStencilOp`) — patrzeć na łańcuchy wywołań.
+- Sampler (`EDEN_NX2_SAMPLE*`) działa tylko w `eden-cli`. W tej sesji podpięto go testowo do GUI:
+  w `src/yuzu/main.cpp` `#include "yuzu_cmd/nx2_sampler.h"` i `Nx2Sampler::StartFromEnvironment()`
+  po `LoadNx2Switches`, a w `src/yuzu/CMakeLists.txt` `../yuzu_cmd/nx2_sampler.cpp`. Działało,
+  cofnięte. GUI czyta zmienne z `%APPDATA%\eden\nx2_switches.txt`.
+- Następny krok: sampler na Low bez `EDEN_NX2_GPU_PROFILE` w tym obszarze (wątki
+  `GPU,GPUBack,CPUCore_*,VulkanWorker`) i ustalenie, który wątek jest na 100%.
+
+### Uruchamianie
+
+- Gra była uruchamiana tak:
+  `build\bin\eglantine.exe -g "<repo>\GAMES\DKB ROM\updates\458752\exefs\main"`.
+  Zapisy i cache shaderów są w `%APPDATA%\eden`. W `nand/user/save/0000000000000000/` są dwa
+  profile, postęp jest w `A166B1F9...`.
+- Użytkownik zgłosił, że przy uruchamianiu samemu z exe traci zapisy, a shadery budują się od
+  nowa. Przyczyny nie sprawdzono (podejrzenie: inna ścieżka gry, np. `base/exefs`, albo inny profil).
+- Build GUI: `source tools/windows/load-msvc-env.sh; cd build; ninja yuzu` (cel `eglantine` nie
+  istnieje).
 
 ## Do zrobienia na Windowsie
 
@@ -119,3 +181,5 @@ z bananem. Zawsze sprawdzać `SetTerminateResult` w logu, zanim uzna się test z
 2. Hand Slap nie podświetla skarbów.
 3. Artefakty w filmikach.
 4. Natywny geometry shader terenu: dlaczego zapisy nie docierają do drugiego przebiegu.
+5. Fiolet poza tunelem: sieć tensorowa DKB (HMMA) — patrz „Fioletowy ekran poza tunelem”.
+6. Wydajność ~10 kl/s poza tunelem: pomiar samplerem bez profilera GPU, potem optymalizacja.
